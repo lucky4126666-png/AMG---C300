@@ -446,11 +446,14 @@ async def health():
 # ======================
 @app.post("/webhook")
 async def webhook(req: Request):
-    data = await req.json()
-    update = types.Update.model_validate(data)
-    await dp.feed_update(bot, update)
+    try:
+        data = await req.json()
+        update = types.Update.model_validate(data)
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        logging.exception(f"Webhook error: {e}")  # ghi log lỗi gốc
+        # ✅ vẫn trả 200 OK để Telegram không coi là "wrong response"
     return {"ok": True}
-
 
 # ======================
 # STARTUP / SHUTDOWN
