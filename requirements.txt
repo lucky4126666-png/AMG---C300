@@ -1,6 +1,6 @@
-aiogram
-SQLAlchemy
-aiosqlite
+aiogram>=3.0
+sqlalchemy>=2.0
 asyncpg
+aiohttp
 python-dotenv
-psycopg2-binary
+aiosqlite
