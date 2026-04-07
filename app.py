@@ -62,11 +62,12 @@ engine_kwargs = {"echo": False, "future": True}
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 else:
+    # Railway PostgreSQL fix SSL
     engine_kwargs["connect_args"] = {
-        "ssl": {
-            "sslmode": "require"
-        }
+        "ssl": "require"
     }
+
+engine = create_async_engine(DATABASE_URL, **engine_kwargs)
     
     engine_kwargs["pool_size"] = 10
     engine_kwargs["max_overflow"] = 20
