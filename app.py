@@ -119,9 +119,20 @@ connections = []
 
 # ================= START =================
 @dp.message(CommandStart())
-async def start(m: types.Message):
-    await m.answer("🚀 Bot Ready")
+async def admin_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ Auto Post", callback_data="auto_menu")],
+        [InlineKeyboardButton(text="🔑 Keyword", callback_data="kw_menu")],
+    ])
 
+
+@dp.message(CommandStart())
+async def start(m: types.Message):
+    await m.answer(
+        "👑 ADMIN PANEL",
+        reply_markup=admin_menu()
+    )
+    
 # ================= KEYWORD =================
 @dp.message()
 async def keyword_handler(m: types.Message):
