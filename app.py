@@ -34,10 +34,15 @@ SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
 @asynccontextmanager
-async def get_db():
-    async with SessionLocal() as db:
-        yield db
-
+async def wait_db():
+    for _ in range(10):
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(select(1))
+            return
+        except:
+            await asyncio.sleep(2)
+            
 # ================= MODELS =================
 class User(Base):
     __tablename__ = "users"
