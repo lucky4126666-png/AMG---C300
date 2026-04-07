@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 import logging
+import contextlib
 
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse
@@ -41,11 +42,11 @@ if not BASE_URL:
 # ======================
 # DB
 # ======================
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
 
-# Railway postgres thường là postgres://... => cần thêm asyncpg
+# Railway postgres thường là postgres://... => chuyển sang asyncpg
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
@@ -90,9 +91,12 @@ class AutoPost(Base):
     chat_id = Column(String)
     text = Column(Text, default="")
     interval = Column(Integer, default=10)
-    # ✅ FIX: dùng đúng cột last_sent (DB đang báo không có last_sent_ts)
+
+    # ✅ dùng đúng tên cột theo lỗi bạn gặp
     last_sent = Column(Integer, default=0)
+
     active = Column(Integer, default=1)
+
 
 # ======================
 # BOT
@@ -107,6 +111,8 @@ admin_cache = set()
 BOT_ID = None
 risk_notified_chats = set()
 init_sent_chats = set()
+
+auto_worker_task: asyncio.Task | None = None
 
 
 def is_allowed(user_id: int):
@@ -174,8 +180,7 @@ async def send_keyword_reply(chat_id: str, k: Keyword):
             caption=caption or None,
             reply_markup=reply_markup
         )
-    else:
-        return await bot.send_message(chat_id, caption or "", reply_markup=reply_markup)
+    return await bot.send_message(chat_id, caption or "", reply_markup=reply_markup)
 
 
 # ======================
@@ -185,6 +190,7 @@ async def send_keyword_reply(chat_id: str, k: Keyword):
 async def auto_reply(m: types.Message):
     if not m.text:
         return
+
     text = m.text or ""
     chat_id = m.chat.id
 
@@ -194,9 +200,9 @@ async def auto_reply(m: types.Message):
     for k in kws:
         if (k.key or "").lower() in text.lower():
             try:
-                await send_keyword_reply(chat_id, k)
-            except Exception as e:
-                logging.error(e)
+                await send_keyword_reply(str(chat_id), k)
+            except Exception:
+                logging.exception("keyword send error")
             break
 
 
@@ -211,7 +217,7 @@ async def auto_worker():
             posts = (await db.execute(select(AutoPost).where(AutoPost.active == 1))).scalars().all()
 
         for p in posts:
-            last = p.last_sent or 0  # ✅ FIX
+            last = p.last_sent or 0
             if now - last >= (p.interval * 60):
                 try:
                     await send_text(p.chat_id, p.text or "")
@@ -219,10 +225,10 @@ async def auto_worker():
                     async with SessionLocal() as db2:
                         row = await db2.get(AutoPost, p.id)
                         if row:
-                            row.last_sent = now  # ✅ FIX
+                            row.last_sent = now
                             await db2.commit()
-                except Exception as e:
-                    logging.error(f"auto error: {e}")
+                except Exception:
+                    logging.exception("auto post error")
 
         await asyncio.sleep(10)
 
@@ -256,7 +262,7 @@ async def group_has_bot_admin(chat_id: str) -> bool:
         admins = await bot.get_chat_administrators(chat_id)
     except Exception as e:
         logging.warning(f"Cannot get admins for chat {chat_id}: {e}")
-        return True
+        return True  # tránh spam nếu không lấy được
 
     admin_ids = {a.user.id for a in admins if a.user}
     return len(admin_ids.intersection(required_ids)) > 0
@@ -298,8 +304,8 @@ async def on_user_join(event: types.ChatMemberUpdated):
 
     try:
         await bot.send_message(chat_id, welcome_text, reply_markup=build_welcome_keyboard())
-    except Exception as e:
-        logging.error(f"send welcome error: {e}")
+    except Exception:
+        logging.exception("send welcome error")
 
 
 @dp.my_chat_member()
@@ -309,24 +315,24 @@ async def on_bot_join(event: types.ChatMemberUpdated):
 
     chat_id = str(event.chat.id)
 
-    # init message (avoid repeat)
+    # init message
     if chat_id not in init_sent_chats:
         init_text = "组防骗助手为您服务,我正在进行相关初始化配置请稍后"
         try:
             await bot.send_message(chat_id, init_text, reply_markup=build_init_keyboard())
-        except Exception as e:
-            logging.error(f"init send error: {e}")
+        except Exception:
+            logging.exception("init send error")
         init_sent_chats.add(chat_id)
 
-    # risk warning (avoid repeat)
+    # risk warning
     if chat_id not in risk_notified_chats:
         ok = await group_has_bot_admin(chat_id)
         if not ok:
             risk_text = "风险提示，本群没有检测到新币管理员。有交易风险，请联系新币工作人员确认 @xbkf"
             try:
                 await bot.send_message(chat_id, risk_text)
-            except Exception as e:
-                logging.error(f"risk send error: {e}")
+            except Exception:
+                logging.exception("risk send error")
             risk_notified_chats.add(chat_id)
 
 
@@ -345,9 +351,6 @@ async def start(m: types.Message):
 # ======================
 # WEB ADMIN PANEL
 # ======================
-app = FastAPI()
-
-
 def check_key(key):
     return key == WEB_ADMIN_KEY
 
@@ -391,6 +394,9 @@ def render_page(admins, key):
     """
 
 
+app = FastAPI()
+
+
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page(key: str = ""):
     if not check_key(key):
@@ -412,11 +418,7 @@ async def add_admin(
         return HTMLResponse("403", status_code=403)
 
     async with SessionLocal() as db:
-        db.add(AdminUser(
-            user_id=user_id,
-            note=note,
-            created_at=int(time.time())
-        ))
+        db.add(AdminUser(user_id=user_id, note=note, created_at=int(time.time())))
         await db.commit()
 
     await load_admin()
@@ -446,28 +448,35 @@ async def health():
 # ======================
 @app.post("/webhook")
 async def webhook(req: Request):
+    """
+    ✅ Fix cho 'Wrong response':
+    - Luôn trả về JSON {"ok": True} dù dp.feed_update có lỗi.
+    - Logging lỗi gốc để bạn debug.
+    """
     try:
         data = await req.json()
         update = types.Update.model_validate(data)
         await dp.feed_update(bot, update)
-    except Exception as e:
-        logging.exception(f"Webhook error: {e}")  # ghi log lỗi gốc
-        # ✅ vẫn trả 200 OK để Telegram không coi là "wrong response"
+    except Exception:
+        logging.exception("Webhook processing error")
     return {"ok": True}
+
 
 # ======================
 # STARTUP / SHUTDOWN
 # ======================
 @app.on_event("startup")
 async def startup():
-    global BOT_ID
+    global BOT_ID, auto_worker_task
+
     BOT_ID = (await bot.get_me()).id
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
     await load_admin()
-    asyncio.create_task(auto_worker())
+
+    auto_worker_task = asyncio.create_task(auto_worker())
 
     await bot.set_webhook(f"{BASE_URL}/webhook")
     logging.info(f"Webhook set: {BASE_URL}/webhook")
@@ -475,4 +484,19 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    await bot.delete_webhook()
+    global auto_worker_task
+
+    if auto_worker_task:
+        auto_worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await auto_worker_task
+
+    try:
+        await bot.delete_webhook()
+    except Exception:
+        pass
+
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
