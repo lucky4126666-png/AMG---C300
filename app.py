@@ -1,18 +1,13 @@
 # =========================================
-# 🚀 FULL SAAS TELEGRAM BOT (PRO MAX)
-# FEATURES:
-# - Auto Post
-# - Keyword Reply
-# - Welcome Message
-# - Admin Menu
-# - Multi Language (VI + CN)
-# - Railway Safe (anti crash)
+# 🚀 TELEGRAM SAAS BOT - FINAL STABLE VERSION
+# FULL: AUTO + KEYWORD + WELCOME + ADMIN + SAFE RAILWAY
 # =========================================
 
 import os
 import time
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
@@ -26,11 +21,11 @@ from sqlalchemy import text as sql_text
 
 # ================= CONFIG =================
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 if not BOT_TOKEN or not BASE_URL or not DATABASE_URL:
     raise RuntimeError("Missing ENV")
@@ -51,8 +46,21 @@ engine = create_async_engine(
     pool_recycle=1800,
     pool_pre_ping=True,
 )
+
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
+
+# ================= DB HELPER =================
+@asynccontextmanager
+async def get_db():
+    async with SessionLocal() as session:
+        try:
+            yield session
+        except:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
 
 # ================= MODELS =================
 class AutoPost(Base):
@@ -82,25 +90,14 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
 
-user_state = {}
 stop_event = asyncio.Event()
 webhook_tasks = set()
 MAX_TASKS = 100
 
-# ================= UTILS =================
-def set_state(uid, k, v):
-    user_state.setdefault(uid, {})[k] = v
-
-def get_state(uid, k):
-    return user_state.get(uid, {}).get(k)
-
-def reset(uid):
-    user_state.pop(uid, None)
-
 # ================= MENU =================
 def admin_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚙️ Auto", callback_data="auto_menu")],
+        [InlineKeyboardButton(text="⚙️ Auto Post", callback_data="auto_menu")],
         [InlineKeyboardButton(text="🔑 Keyword", callback_data="kw_menu")],
     ])
 
@@ -112,38 +109,45 @@ async def start(m: types.Message):
 # ================= KEYWORD =================
 @dp.message()
 async def keyword_handler(m: types.Message):
-    async with SessionLocal() as db:
-        rows = (await db.execute(select(Keyword))).scalars().all()
+    if not m.text:
+        return
 
-    for k in rows:
-        if k.key.lower() in m.text.lower():
-            return await m.answer(k.text)
+    async with get_db() as db:
+        row = (await db.execute(
+            select(Keyword).where(Keyword.key.ilike(f"%{m.text}%"))
+        )).scalars().first()
 
-# ================= AUTO POST =================
+    if row:
+        await m.answer(row.text)
+
+# ================= AUTO WORKER =================
 async def auto_worker():
     try:
         while not stop_event.is_set():
             now = int(time.time())
 
-            async with SessionLocal() as db:
-                rows = (await db.execute(select(AutoPost))).scalars().all()
+            async with get_db() as db:
+                rows = (await db.execute(
+                    select(AutoPost).where(AutoPost.active == 1)
+                )).scalars().all()
 
             for p in rows:
-                if not p.active:
-                    continue
-
                 if now - (p.last_sent or 0) >= p.interval * 60:
                     try:
-                        await bot.send_message(p.chat_id, p.text)
+                        await asyncio.wait_for(
+                            bot.send_message(p.chat_id, p.text),
+                            timeout=10
+                        )
 
-                        async with SessionLocal() as db:
+                        async with get_db() as db:
                             row = await db.get(AutoPost, p.id)
                             row.last_sent = now
                             await db.commit()
-                    except Exception as e:
-                        logging.error(e)
 
-            await asyncio.sleep(10)
+                    except Exception as e:
+                        logging.error(f"AUTO ERROR: {e}")
+
+            await asyncio.sleep(15)
 
     except Exception as e:
         logging.error(f"WORKER CRASH: {e}")
@@ -157,8 +161,10 @@ async def welcome(event: types.ChatMemberUpdated):
     user = event.new_chat_member.user
     chat_id = str(event.chat.id)
 
-    async with SessionLocal() as db:
-        row = (await db.execute(select(Welcome).where(Welcome.chat_id == chat_id))).scalars().first()
+    async with get_db() as db:
+        row = (await db.execute(
+            select(Welcome).where(Welcome.chat_id == chat_id)
+        )).scalars().first()
 
     if row and row.enabled:
         text = (row.text or "Welcome {name}").replace("{name}", user.full_name)
@@ -201,6 +207,8 @@ async def wait_for_db():
 
 @app.on_event("startup")
 async def startup():
+    logging.info("🚀 STARTING BOT...")
+
     await wait_for_db()
 
     async with engine.begin() as conn:
@@ -212,6 +220,8 @@ async def startup():
     await bot.set_webhook(webhook_url)
 
     asyncio.create_task(auto_worker())
+
+    logging.info("✅ BOT READY")
 
 # ================= SHUTDOWN =================
 @app.on_event("shutdown")
@@ -227,4 +237,8 @@ async def shutdown():
 # ================= RUN =================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000))
+    )
