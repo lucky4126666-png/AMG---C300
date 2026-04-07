@@ -42,22 +42,14 @@ if not BASE_URL:
 # DB
 # ======================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./bot.db")
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
 
-# Railway thường cho postgres://... (chỉ driver sync)
+# Railway postgres thường là postgres://... => cần thêm asyncpg
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-
-engine = create_async_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -98,7 +90,8 @@ class AutoPost(Base):
     chat_id = Column(String)
     text = Column(Text, default="")
     interval = Column(Integer, default=10)
-    last_sent_ts = Column(Integer, default=0)
+    # ✅ FIX: dùng đúng cột last_sent (DB đang báo không có last_sent_ts)
+    last_sent = Column(Integer, default=0)
     active = Column(Integer, default=1)
 
 # ======================
@@ -139,9 +132,6 @@ def parse_inline_buttons(button_str: str):
     Format bạn hay dùng:
       Dòng mới = hàng
       Trong 1 hàng: "Text - URL && Text2 - URL2"
-    Ví dụ:
-      Link 1 - https://a.com && Link 2 - https://b.com
-      Link 3 - https://c.com
     """
     if not button_str:
         return None
@@ -155,7 +145,6 @@ def parse_inline_buttons(button_str: str):
         parts = [p.strip() for p in ln.split("&&") if p.strip()]
         row_buttons = []
         for p in parts:
-            # split "Text - URL"
             if "-" not in p:
                 continue
             text_part, url_part = p.split("-", 1)
@@ -173,21 +162,18 @@ def parse_inline_buttons(button_str: str):
 
 
 async def send_keyword_reply(chat_id: str, k: Keyword):
-    """
-    Gửi đúng dạng:
-    - nếu k.image có => send_photo với caption = k.text (nếu có)
-    - nếu có button => gắn inline keyboard
-    - nếu không ảnh => send_message
-    """
     reply_markup = parse_inline_buttons(k.button)
 
     img = (k.image or "").strip()
     caption = (k.text or "").strip()
 
     if img:
-        # giả định k.image là file_id hoặc url
-        # aiogram sẽ xử lý file_id nếu hợp lệ, còn url thì gửi theo url
-        return await bot.send_photo(chat_id, photo=img, caption=caption or None, reply_markup=reply_markup)
+        return await bot.send_photo(
+            chat_id,
+            photo=img,
+            caption=caption or None,
+            reply_markup=reply_markup
+        )
     else:
         return await bot.send_message(chat_id, caption or "", reply_markup=reply_markup)
 
@@ -225,14 +211,15 @@ async def auto_worker():
             posts = (await db.execute(select(AutoPost).where(AutoPost.active == 1))).scalars().all()
 
         for p in posts:
-            last = p.last_sent_ts or 0
+            last = p.last_sent or 0  # ✅ FIX
             if now - last >= (p.interval * 60):
                 try:
                     await send_text(p.chat_id, p.text or "")
+
                     async with SessionLocal() as db2:
                         row = await db2.get(AutoPost, p.id)
                         if row:
-                            row.last_sent_ts = now
+                            row.last_sent = now  # ✅ FIX
                             await db2.commit()
                 except Exception as e:
                     logging.error(f"auto error: {e}")
@@ -262,9 +249,6 @@ def build_init_keyboard():
 
 
 async def group_has_bot_admin(chat_id: str) -> bool:
-    """
-    Kiểm tra group có chứa admin/owner của bot hay không
-    """
     required_ids = set(admin_cache)
     required_ids.add(OWNER_ID)
 
@@ -272,7 +256,6 @@ async def group_has_bot_admin(chat_id: str) -> bool:
         admins = await bot.get_chat_administrators(chat_id)
     except Exception as e:
         logging.warning(f"Cannot get admins for chat {chat_id}: {e}")
-        # Nếu không lấy được admin list => không spam cảnh báo sai
         return True
 
     admin_ids = {a.user.id for a in admins if a.user}
@@ -281,10 +264,6 @@ async def group_has_bot_admin(chat_id: str) -> bool:
 
 @dp.chat_member()
 async def on_user_join(event: types.ChatMemberUpdated):
-    """
-    Chỉ gửi welcome cho NGƯỜI dùng join.
-    Skip BOT để tránh lúc add bot cũng bị welcome dài.
-    """
     if event.new_chat_member.status != "member":
         return
 
@@ -292,11 +271,9 @@ async def on_user_join(event: types.ChatMemberUpdated):
     if not u:
         return
 
-    # ✅ skip nếu join là bot
+    # skip bot join
     if u.is_bot:
         return
-
-    # ✅ skip nếu join là chính bot của chúng ta
     if BOT_ID is not None and u.id == BOT_ID:
         return
 
@@ -310,7 +287,6 @@ async def on_user_join(event: types.ChatMemberUpdated):
             )
         )).scalars().first()
 
-    # Nếu chưa cấu hình welcome theo chat_id thì thôi
     if not w or not (w.text or "").strip():
         return
 
@@ -318,7 +294,6 @@ async def on_user_join(event: types.ChatMemberUpdated):
     name = (u.full_name or u.username or "VIP").strip()
 
     welcome_text = (w.text or "")
-    # thay placeholder đơn giản
     welcome_text = welcome_text.replace("{name}", name).replace("{group}", group_title)
 
     try:
@@ -329,17 +304,12 @@ async def on_user_join(event: types.ChatMemberUpdated):
 
 @dp.my_chat_member()
 async def on_bot_join(event: types.ChatMemberUpdated):
-    """
-    Khi bot được add vào group:
-    - gửi init message + 2 nút
-    - nếu không thấy owner/admin bot trong danh sách admin group => gửi risk warning
-    """
     if event.new_chat_member.status not in ("member", "administrator", "creator"):
         return
 
     chat_id = str(event.chat.id)
 
-    # init message (tránh gửi lặp)
+    # init message (avoid repeat)
     if chat_id not in init_sent_chats:
         init_text = "组防骗助手为您服务,我正在进行相关初始化配置请稍后"
         try:
@@ -348,7 +318,7 @@ async def on_bot_join(event: types.ChatMemberUpdated):
             logging.error(f"init send error: {e}")
         init_sent_chats.add(chat_id)
 
-    # risk warning (tránh gửi lặp)
+    # risk warning (avoid repeat)
     if chat_id not in risk_notified_chats:
         ok = await group_has_bot_admin(chat_id)
         if not ok:
@@ -375,6 +345,9 @@ async def start(m: types.Message):
 # ======================
 # WEB ADMIN PANEL
 # ======================
+app = FastAPI()
+
+
 def check_key(key):
     return key == WEB_ADMIN_KEY
 
@@ -416,9 +389,6 @@ def render_page(admins, key):
     </body>
     </html>
     """
-
-
-app = FastAPI()
 
 
 @app.get("/admin", response_class=HTMLResponse)
