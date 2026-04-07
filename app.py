@@ -217,17 +217,34 @@ async def auto_worker():
         await asyncio.sleep(10)
 
 # ================= WEBHOOK =================
+webhook_tasks = set()
+MAX_TASKS = 100
+
 @app.post("/webhook")
 async def webhook(req: Request):
     data = await req.json()
     update = types.Update.model_validate(data)
-    await dp.feed_update(bot, update)
+
+    if len(webhook_tasks) > MAX_TASKS:
+        return {"ok": True}
+
+    async def process():
+        try:
+            await dp.feed_update(bot, update)
+        except Exception:
+            logging.exception("Update error")
+
+    task = asyncio.create_task(process())
+    webhook_tasks.add(task)
+    task.add_done_callback(lambda t: webhook_tasks.discard(t))
+
     return {"ok": True}
 
 
 @app.get("/")
 async def root():
     return {"status": "running"}
+
 
 # ================= STARTUP =================
 @app.on_event("startup")
@@ -236,12 +253,23 @@ async def startup():
         await conn.run_sync(Base.metadata.create_all)
 
     asyncio.create_task(auto_worker())
-    await bot.set_webhook(f"{BASE_URL}/webhook")
+
+    webhook_url = f"{BASE_URL}/webhook"
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(webhook_url)
+
+    logging.info(f"Webhook set: {webhook_url}")
+
 
 # ================= SHUTDOWN =================
 @app.on_event("shutdown")
 async def shutdown():
     stop_event.set()
+
+    for t in list(webhook_tasks):
+        t.cancel()
+
     await bot.delete_webhook()
     await bot.session.close()
 
