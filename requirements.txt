@@ -3,5 +3,6 @@ uvicorn
 aiogram
 sqlalchemy
 asyncpg
-openai
 PyJWT
+passlib[bcrypt]
+bcrypt
