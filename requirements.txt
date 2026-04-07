@@ -5,3 +5,4 @@ sqlalchemy
 asyncpg
 python-dotenv
 openai
+python-multipart
