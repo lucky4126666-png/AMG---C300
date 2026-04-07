@@ -136,7 +136,7 @@ async def start(m: types.Message):
 # ================= KEYWORD =================
 @dp.message()
 async def keyword_handler(m: types.Message):
-    if not m.text:
+    if m.text.startswith("/"):
         return
 
     async with get_db() as db:
