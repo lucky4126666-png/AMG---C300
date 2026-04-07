@@ -1,6 +1,7 @@
-aiogram>=3.0
-sqlalchemy>=2.0
+sqlalchemy
 asyncpg
 aiohttp
 python-dotenv
 aiosqlite
+aiogram
+uvicorn
