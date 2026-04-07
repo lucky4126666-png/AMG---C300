@@ -224,6 +224,11 @@ async def webhook(req: Request):
     await dp.feed_update(bot, update)
     return {"ok": True}
 
+
+@app.get("/")
+async def root():
+    return {"status": "running"}
+
 # ================= STARTUP =================
 @app.on_event("startup")
 async def startup():
