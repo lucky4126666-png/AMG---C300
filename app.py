@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
@@ -31,15 +32,12 @@ def normalize_database_url(url: str | None) -> str:
     if not url:
         return "sqlite+aiosqlite:///bot.db"
 
-    # Nếu dán nhầm dạng postgres://... thì đổi đúng
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
 
-    # Nếu dán nhầm dạng postgresql://... thì đổi đúng
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-    # Nếu đã đúng thì giữ nguyên
     return url
 
 
@@ -57,23 +55,19 @@ if not BOT_TOKEN:
 # ======================
 # DB ENGINE
 # ======================
-engine_kwargs = {"echo": False, "future": True}
+engine_kwargs = {"echo": False, "future": True, "pool_pre_ping": True}
 
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 else:
-    # Railway PostgreSQL fix SSL
-    engine_kwargs["connect_args"] = {
-        "ssl": "require"
-    }
-
-engine = create_async_engine(DATABASE_URL, **engine_kwargs)
-    
-    engine_kwargs["pool_size"] = 10
-    engine_kwargs["max_overflow"] = 20
-    engine_kwargs["pool_timeout"] = 30
-    engine_kwargs["pool_recycle"] = 1800
-    engine_kwargs["connect_args"] = {"ssl": ssl_context}
+    ssl_context = ssl.create_default_context()
+    engine_kwargs.update({
+        "pool_size": 10,
+        "max_overflow": 20,
+        "pool_timeout": 30,
+        "pool_recycle": 1800,
+        "connect_args": {"ssl": ssl_context},
+    })
 
 engine = create_async_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -87,6 +81,36 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
+
+# ======================
+# WEB
+# ======================
+web_runner: Optional[web.AppRunner] = None
+
+
+async def health(request):
+    return web.Response(text="OK")
+
+
+async def start_web():
+    global web_runner
+    app = web.Application()
+    app.router.add_get("/", health)
+
+    port = int(os.getenv("PORT", 8080))
+    web_runner = web.AppRunner(app)
+    await web_runner.setup()
+
+    site = web.TCPSite(web_runner, "0.0.0.0", port)
+    await site.start()
+    logging.info("Web server started on port %s", port)
+
+
+async def stop_web():
+    global web_runner
+    if web_runner:
+        await web_runner.cleanup()
+        web_runner = None
 
 # ======================
 # MEMORY / CACHE
@@ -359,7 +383,7 @@ def cleanup_last_trigger():
 async def send_or_edit_private_home(uid: int, chat_id: int):
     old_msg_id = private_menu_msg.get(uid)
     if old_msg_id:
-        with contextlib.suppress(Exception):
+        try:
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=old_msg_id,
@@ -367,6 +391,8 @@ async def send_or_edit_private_home(uid: int, chat_id: int):
                 reply_markup=start_menu_kb(uid)
             )
             return
+        except Exception:
+            pass
 
     msg = await bot.send_message(chat_id, "🏠 首页", reply_markup=start_menu_kb(uid))
     private_menu_msg[uid] = msg.message_id
@@ -686,7 +712,7 @@ async def show_wl_view(message, wid):
         message,
         f"群组欢迎详情\n\n"
         f"状态：{'开启' if w.active else '关闭'}\n"
-        f"删除消息：{w.delete_after if w.delete_after else '不删除'} 分钟\n"
+        f"删除消息：{w.delete_after if w.delete_after else 0} 分钟\n"
         f"图片：{'✅' if w.image else '❌'}\n"
         f"按钮：{'✅' if w.button else '❌'}\n"
         f"文本：{'✅' if w.text else '❌'}",
@@ -752,7 +778,8 @@ async def show_auto_view(message, pid):
         f"间隔：{p.interval} 分钟\n"
         f"开始：{p.start_at or '-'}\n"
         f"结束：{p.end_at or '-'}\n"
-        f"最近发送：{last_time}\n\n"
+        f"最近发送：{last_time}\n"
+        f"群组：{p.chat_id}\n\n"
         f"图片：{'✅' if p.image else '❌'}\n"
         f"按钮：{'✅' if p.button else '❌'}\n"
         f"文本：{'✅' if p.text else '❌'}",
@@ -765,6 +792,7 @@ async def show_auto_view(message, pid):
                 text=f"📌 置顶：{'✅ 是' if p.pin else '❌ 否'}",
                 callback_data=f"auto_pin_{p.id}"
             )],
+            [InlineKeyboardButton(text="👥 修改群组", callback_data=f"auto_chat_{p.id}")],
             [InlineKeyboardButton(text="📝 修改文本", callback_data=f"auto_text_{p.id}")],
             [InlineKeyboardButton(text="📷 修改媒体", callback_data=f"auto_img_{p.id}")],
             [InlineKeyboardButton(text="🔤 修改按钮", callback_data=f"auto_btn_{p.id}")],
@@ -831,7 +859,9 @@ async def cmd_admins(m: types.Message):
     rows = await get_all_admin_users()
     text = ["<b>ADMIN STATUS</b>"]
     text.append(f"Owner: <code>{OWNER_ID}</code>")
-    text.append("ENV ADMIN_IDS: " + (", ".join(f"<code>{x}</code>" for x in sorted(ADMIN_IDS)) if ADMIN_IDS else "<i>空</i>"))
+    text.append("ENV ADMIN_IDS: " + (
+        ", ".join(f"<code>{x}</code>" for x in sorted(ADMIN_IDS)) if ADMIN_IDS else "<i>空</i>"
+    ))
 
     if rows:
         text.append("\nDB Admins:")
@@ -886,7 +916,7 @@ async def cmd_admindel(m: types.Message):
 # ======================
 # START / HOME
 # ======================
-@dp.message(F.text == "/start")
+@dp.message(F.text.startswith("/start"))
 async def start(m: types.Message):
     if not m.from_user:
         return
@@ -2041,6 +2071,12 @@ async def on_startup():
     await ensure_schema()
     await load_admin_cache()
     await load_cache()
+
+    # Nếu bot từng set webhook thì xóa để polling chạy ổn
+    with contextlib.suppress(Exception):
+        await bot.delete_webhook(drop_pending_updates=True)
+
+    await start_web()
     worker_task = asyncio.create_task(auto_worker())
     logging.info("READY")
 
@@ -2051,6 +2087,8 @@ async def on_shutdown():
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
+
+    await stop_web()
 
     with contextlib.suppress(Exception):
         await bot.session.close()
@@ -2068,17 +2106,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-from aiohttp import web
-
-async def health(request):
-    return web.Response(text="OK")
-
-async def start_web():
-    app = web.Application()
-    app.router.add_get("/", health)
-
-    port = int(os.getenv("PORT", 8080))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
