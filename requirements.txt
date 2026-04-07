@@ -3,7 +3,5 @@ uvicorn
 aiogram
 sqlalchemy
 asyncpg
-python-dotenv
 openai
-python-multipart
 PyJWT
