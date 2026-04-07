@@ -1,184 +1,241 @@
-import os, asyncio, time, contextlib
-from fastapi import FastAPI, Request
+import os
+import time
+import asyncio
+import contextlib
+from datetime import datetime
+
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import declarative_base
+
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, Text, select, delete
-from dotenv import load_dotenv
 
-load_dotenv()
-
+# ======================
+# ENV
+# ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL")
-DATABASE_URL = os.getenv("DATABASE_URL")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+WEB_ADMIN_KEY = os.getenv("WEB_ADMIN_KEY", "")
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-app = FastAPI()
+# ======================
+# DB
+# ======================
+DATABASE_URL = "sqlite+aiosqlite:///./bot.db"
 
 engine = create_async_engine(DATABASE_URL, echo=False)
-SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
-
-# ======================
-# STATE
-# ======================
-user_state = {}
-temp = {}
-last_sent = {}
-
-def reset(uid):
-    user_state.pop(uid, None)
-    temp.pop(uid, None)
-
-# ======================
-# BUTTON
-# ======================
-def parse_buttons(text):
-    if not text:
-        return None
-    rows = []
-    for line in text.split("\n"):
-        row = []
-        for part in line.split("&&"):
-            if "-" in part:
-                t, u = part.split("-", 1)
-                row.append({"text": t.strip(), "url": u.strip()})
-        if row:
-            rows.append(row)
-    return rows
-
-def build_buttons(data):
-    if not data:
-        return None
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=b["text"], url=b["url"]) for b in row]
-        for row in data
-    ])
 
 # ======================
 # MODELS
 # ======================
+class AdminUser(Base):
+    __tablename__ = "admin_users"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, unique=True, index=True)
+    note = Column(String, default="")
+    created_at = Column(Integer, default=0)
+
+
 class Keyword(Base):
     __tablename__ = "keywords"
     id = Column(Integer, primary_key=True)
     key = Column(String, unique=True)
-    text = Column(Text)
-    image = Column(Text)
-    button = Column(Text)
+    text = Column(Text, default="")
+    image = Column(String, default="")
+    button = Column(Text, default="")
+    active = Column(Integer, default=1)
+
+
+class WelcomeSetting(Base):
+    __tablename__ = "welcome"
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(String)
+    text = Column(Text, default="")
+    active = Column(Integer, default=1)
+
 
 class AutoPost(Base):
     __tablename__ = "auto_post"
     id = Column(Integer, primary_key=True)
     chat_id = Column(String)
-    text = Column(Text)
-    image = Column(Text)
-    button = Column(Text)
+    text = Column(Text, default="")
     interval = Column(Integer, default=10)
-    is_active = Column(Integer, default=0)
-    pin = Column(Integer, default=0)
+    last_sent_ts = Column(Integer, default=0)
+    active = Column(Integer, default=1)
 
 # ======================
-# MENU
+# BOT
 # ======================
-def home():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📌 Từ khoá", callback_data="kw_menu")],
-        [InlineKeyboardButton(text="📅 Auto Post", callback_data="auto_menu")]
-    ])
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
 # ======================
-# HELPERS
+# CACHE
 # ======================
-async def send_preview(chat_id, text=None, image=None, button=None):
-    kb = build_buttons(parse_buttons(button))
-    if image:
-        return await bot.send_photo(chat_id, image, caption=text or "", reply_markup=kb)
-    return await bot.send_message(chat_id, text or " ", reply_markup=kb)
+admin_cache = set()
 
-def get_image(m: types.Message):
-    if m.photo:
-        return m.photo[-1].file_id
-    if m.text:
-        return m.text.strip()
-    return None
+def is_allowed(user_id: int):
+    return user_id == OWNER_ID or user_id in admin_cache
+
+async def load_admin():
+    global admin_cache
+    async with SessionLocal() as db:
+        rows = (await db.execute(select(AdminUser))).scalars().all()
+    admin_cache = {r.user_id for r in rows}
+
+# ======================
+# HELPER
+# ======================
+async def send_text(chat_id, text):
+    return await bot.send_message(chat_id, text)
 
 # ======================
 # START
 # ======================
 @dp.message(F.text == "/start")
 async def start(m: types.Message):
-    reset(m.from_user.id)
-    await m.answer("🚀 Menu", reply_markup=home())
+    if not m.from_user:
+        return
 
-@dp.callback_query(F.data == "home")
-async def go_home(c: types.CallbackQuery):
-    await c.answer()
-    await c.message.edit_text("🚀 Menu", reply_markup=home())
+    if not is_allowed(m.from_user.id):
+        return await m.answer("❌ Không có quyền")
+
+    await m.answer("🏠 Bot ready")
 
 # ======================
 # KEYWORD AUTO REPLY
 # ======================
 @dp.message()
-async def all_msg(m: types.Message):
-    uid = m.from_user.id
-    text = (m.text or "").strip().lower()
-
-    if not text or text.startswith("/"):
+async def auto_reply(m: types.Message):
+    if not m.text:
         return
 
     async with SessionLocal() as db:
-        kws = (await db.execute(select(Keyword))).scalars().all()
+        kws = (await db.execute(
+            select(Keyword).where(Keyword.active == 1)
+        )).scalars().all()
 
     for k in kws:
-        if k.key.lower() == text:
-            return await send_preview(
-                m.chat.id,
-                k.text,
-                k.image,
-                k.button
-            )
+        if k.key.lower() in m.text.lower():
+            await send_text(m.chat.id, k.text)
+            break
 
 # ======================
-# AUTO WORKER (FIX INTERVAL)
+# AUTO POST WORKER
 # ======================
 async def auto_worker():
     while True:
-        now = time.time()
+        now = int(time.time())
 
         async with SessionLocal() as db:
             posts = (await db.execute(
-                select(AutoPost).where(AutoPost.is_active == 1)
+                select(AutoPost).where(AutoPost.active == 1)
             )).scalars().all()
 
         for p in posts:
-            interval = max(p.interval, 1) * 60
-            last = last_sent.get(p.id, 0)
+            if now - p.last_sent_ts >= p.interval * 60:
+                try:
+                    await send_text(p.chat_id, p.text)
 
-            if now - last < interval:
-                continue
-
-            try:
-                msg = await send_preview(
-                    p.chat_id,
-                    p.text,
-                    p.image,
-                    p.button
-                )
-
-                last_sent[p.id] = now
-
-                if p.pin:
-                    try:
-                        await bot.pin_chat_message(p.chat_id, msg.message_id)
-                    except:
-                        pass
-
-            except Exception as e:
-                print("Auto lỗi:", e)
+                    async with SessionLocal() as db:
+                        row = await db.get(AutoPost, p.id)
+                        if row:
+                            row.last_sent_ts = now
+                            await db.commit()
+                except Exception as e:
+                    print("auto error:", e)
 
         await asyncio.sleep(10)
+
+# ======================
+# WEB ADMIN PANEL
+# ======================
+def check_key(key):
+    return key == WEB_ADMIN_KEY
+
+def render_page(admins, key):
+    rows = ""
+    for a in admins:
+        rows += f"""
+        <tr>
+            <td>{a.user_id}</td>
+            <td>{a.note}</td>
+            <td>
+                <form method="post" action="/admin/delete">
+                    <input type="hidden" name="key" value="{key}">
+                    <input type="hidden" name="user_id" value="{a.user_id}">
+                    <button>Delete</button>
+                </form>
+            </td>
+        </tr>
+        """
+
+    return f"""
+    <html>
+    <body>
+    <h2>Admin Panel</h2>
+
+    <form method="post" action="/admin/add">
+        <input type="hidden" name="key" value="{key}">
+        <input name="user_id" placeholder="User ID">
+        <input name="note" placeholder="Note">
+        <button>Add</button>
+    </form>
+
+    <table border="1">
+        <tr><th>ID</th><th>Note</th><th>Action</th></tr>
+        {rows}
+    </table>
+
+    </body>
+    </html>
+    """
+
+app = FastAPI()
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(key: str = ""):
+    if not check_key(key):
+        return HTMLResponse("403", status_code=403)
+
+    async with SessionLocal() as db:
+        admins = (await db.execute(select(AdminUser))).scalars().all()
+
+    return render_page(admins, key)
+
+@app.post("/admin/add", response_class=HTMLResponse)
+async def add_admin(key: str = Form(""), user_id: int = Form(...), note: str = Form("")):
+    if not check_key(key):
+        return HTMLResponse("403", status_code=403)
+
+    async with SessionLocal() as db:
+        db.add(AdminUser(
+            user_id=user_id,
+            note=note,
+            created_at=int(time.time())
+        ))
+        await db.commit()
+
+    await load_admin()
+    return HTMLResponse("OK")
+
+@app.post("/admin/delete", response_class=HTMLResponse)
+async def del_admin(key: str = Form(""), user_id: int = Form(...)):
+    if not check_key(key):
+        return HTMLResponse("403", status_code=403)
+
+    async with SessionLocal() as db:
+        await db.execute(delete(AdminUser).where(AdminUser.user_id == user_id))
+        await db.commit()
+
+    await load_admin()
+    return HTMLResponse("Deleted")
 
 # ======================
 # WEBHOOK
@@ -186,13 +243,9 @@ async def auto_worker():
 @app.post("/webhook")
 async def webhook(req: Request):
     data = await req.json()
-    update = types.Update.model_validate(data)  # FIX
+    update = types.Update.model_validate(data)
     await dp.feed_update(bot, update)
     return {"ok": True}
-
-@app.get("/")
-async def root():
-    return {"status": "ok"}
 
 # ======================
 # STARTUP
@@ -202,15 +255,15 @@ async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+    await load_admin()
+
     asyncio.create_task(auto_worker())
 
-    await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(f"{BASE_URL}/webhook")
 
-    print("READY")
-
+# ======================
+# SHUTDOWN
+# ======================
 @app.on_event("shutdown")
 async def shutdown():
-    with contextlib.suppress(Exception):
-        await bot.delete_webhook()
-    await bot.session.close()
+    await bot.delete_webhook()
