@@ -1,13 +1,18 @@
-# =============================
-# FULL SAAS TELEGRAM BOT (FINAL)
-# AUTO POST UI + MULTI LANGUAGE (CN + VI)
-# =============================
+# =========================================
+# 🚀 FULL SAAS TELEGRAM BOT (PRO MAX)
+# FEATURES:
+# - Auto Post
+# - Keyword Reply
+# - Welcome Message
+# - Admin Menu
+# - Multi Language (VI + CN)
+# - Railway Safe (anti crash)
+# =========================================
 
 import os
 import time
 import asyncio
 import logging
-from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
@@ -17,6 +22,7 @@ from aiogram.filters import CommandStart
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, Text, select
+from sqlalchemy import text as sql_text
 
 # ================= CONFIG =================
 logging.basicConfig(level=logging.INFO)
@@ -44,7 +50,6 @@ Base = declarative_base()
 # ================= MODELS =================
 class AutoPost(Base):
     __tablename__ = "auto_post"
-
     id = Column(Integer, primary_key=True)
     chat_id = Column(String)
     text = Column(Text)
@@ -52,11 +57,18 @@ class AutoPost(Base):
     last_sent = Column(Integer, default=0)
     active = Column(Integer, default=1)
 
-class UserLang(Base):
-    __tablename__ = "user_lang"
+class Keyword(Base):
+    __tablename__ = "keyword"
+    id = Column(Integer, primary_key=True)
+    key = Column(String)
+    text = Column(Text)
 
-    user_id = Column(Integer, primary_key=True)
-    lang = Column(String, default="vi")  # vi / cn
+class Welcome(Base):
+    __tablename__ = "welcome"
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(String)
+    text = Column(Text)
+    enabled = Column(Integer, default=1)
 
 # ================= BOT =================
 bot = Bot(token=BOT_TOKEN)
@@ -65,13 +77,10 @@ app = FastAPI()
 
 user_state = {}
 stop_event = asyncio.Event()
+webhook_tasks = set()
+MAX_TASKS = 100
 
-# ================= LANG =================
-def t(uid, vi, cn):
-    lang = user_state.get(uid, {}).get("lang", "vi")
-    return cn if lang == "cn" else vi
-
-# ================= STATE =================
+# ================= UTILS =================
 def set_state(uid, k, v):
     user_state.setdefault(uid, {})[k] = v
 
@@ -82,143 +91,78 @@ def reset(uid):
     user_state.pop(uid, None)
 
 # ================= MENU =================
-def admin_menu(uid):
+def admin_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚙️ Auto Post", callback_data="auto_menu")],
-        [InlineKeyboardButton(text="🌐 Language", callback_data="lang_menu")]
+        [InlineKeyboardButton(text="⚙️ Auto", callback_data="auto_menu")],
+        [InlineKeyboardButton(text="🔑 Keyword", callback_data="kw_menu")],
     ])
 
 # ================= START =================
 @dp.message(CommandStart())
 async def start(m: types.Message):
-    await m.answer("👑 Admin Panel", reply_markup=admin_menu(m.from_user.id))
+    await m.answer("👑 ADMIN PANEL", reply_markup=admin_menu())
 
-# ================= LANGUAGE =================
-@dp.callback_query(F.data == "lang_menu")
-async def lang_menu(c: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇻🇳 Tiếng Việt", callback_data="lang_vi")],
-        [InlineKeyboardButton(text="🇨🇳 中文", callback_data="lang_cn")]
-    ])
-    await c.message.answer("Chọn ngôn ngữ / 选择语言", reply_markup=kb)
-    await c.answer()
-
-@dp.callback_query(F.data.startswith("lang_"))
-async def set_lang(c: types.CallbackQuery):
-    lang = c.data.split("_")[1]
-    user_state.setdefault(c.from_user.id, {})["lang"] = lang
-    await c.answer("✅ OK")
-
-# ================= AUTO MENU =================
-@dp.callback_query(F.data == "auto_menu")
-async def auto_menu(c: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Add", callback_data="auto_add")],
-        [InlineKeyboardButton(text="📋 List", callback_data="auto_list")],
-    ])
-    await c.message.answer("Auto Post", reply_markup=kb)
-    await c.answer()
-
-# ================= ADD =================
-@dp.callback_query(F.data == "auto_add")
-async def auto_add(c: types.CallbackQuery):
-    set_state(c.from_user.id, "step", "auto_text")
-    await c.message.answer("Nhập nội dung / 输入内容")
-    await c.answer()
-
-@dp.message(F.text)
-async def auto_flow(m: types.Message):
-    uid = m.from_user.id
-    step = get_state(uid, "step")
-
-    if step == "auto_text":
-        set_state(uid, "auto_text", m.text)
-        set_state(uid, "step", "auto_interval")
-        return await m.answer("Interval (minutes):")
-
-    if step == "auto_interval":
-        try:
-            interval = int(m.text)
-        except:
-            return await m.answer("Invalid number")
-
-        text = get_state(uid, "auto_text")
-
-        async with SessionLocal() as db:
-            db.add(AutoPost(chat_id=str(m.chat.id), text=text, interval=interval))
-            await db.commit()
-
-        reset(uid)
-        return await m.answer("✅ Created")
-
-# ================= LIST =================
-@dp.callback_query(F.data == "auto_list")
-async def auto_list(c: types.CallbackQuery):
+# ================= KEYWORD =================
+@dp.message()
+async def keyword_handler(m: types.Message):
     async with SessionLocal() as db:
-        rows = (await db.execute(select(AutoPost))).scalars().all()
+        rows = (await db.execute(select(Keyword))).scalars().all()
 
-    kb = []
-    for p in rows:
-        kb.append([
-            InlineKeyboardButton(text=f"{p.id} {'✅' if p.active else '❌'}", callback_data=f"auto_toggle:{p.id}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"auto_del:{p.id}")
-        ])
+    for k in rows:
+        if k.key.lower() in m.text.lower():
+            return await m.answer(k.text)
 
-    await c.message.answer("List", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    await c.answer()
-
-# ================= TOGGLE =================
-@dp.callback_query(F.data.startswith("auto_toggle:"))
-async def auto_toggle(c: types.CallbackQuery):
-    pid = int(c.data.split(":")[1])
-
-    async with SessionLocal() as db:
-        row = await db.get(AutoPost, pid)
-        row.active = 0 if row.active else 1
-        await db.commit()
-
-    await c.answer("Updated")
-
-# ================= DELETE =================
-@dp.callback_query(F.data.startswith("auto_del:"))
-async def auto_del(c: types.CallbackQuery):
-    pid = int(c.data.split(":")[1])
-
-    async with SessionLocal() as db:
-        row = await db.get(AutoPost, pid)
-        await db.delete(row)
-        await db.commit()
-
-    await c.answer("Deleted")
-
-# ================= WORKER =================
+# ================= AUTO POST =================
 async def auto_worker():
-    while not stop_event.is_set():
-        now = int(time.time())
+    try:
+        while not stop_event.is_set():
+            now = int(time.time())
 
-        async with SessionLocal() as db:
-            rows = (await db.execute(select(AutoPost))).scalars().all()
+            async with SessionLocal() as db:
+                rows = (await db.execute(select(AutoPost))).scalars().all()
 
-        for p in rows:
-            if not p.active:
-                continue
+            for p in rows:
+                if not p.active:
+                    continue
 
-            if now - (p.last_sent or 0) >= p.interval * 60:
-                try:
-                    await bot.send_message(p.chat_id, p.text)
+                if now - (p.last_sent or 0) >= p.interval * 60:
+                    try:
+                        await bot.send_message(p.chat_id, p.text)
 
-                    async with SessionLocal() as db:
-                        row = await db.get(AutoPost, p.id)
-                        row.last_sent = now
-                        await db.commit()
-                except Exception as e:
-                    logging.error(e)
+                        async with SessionLocal() as db:
+                            row = await db.get(AutoPost, p.id)
+                            row.last_sent = now
+                            await db.commit()
+                    except Exception as e:
+                        logging.error(e)
 
-        await asyncio.sleep(10)
+            await asyncio.sleep(10)
+
+    except Exception as e:
+        logging.error(f"WORKER CRASH: {e}")
+
+# ================= WELCOME =================
+@dp.chat_member()
+async def welcome(event: types.ChatMemberUpdated):
+    if event.new_chat_member.status != "member":
+        return
+
+    user = event.new_chat_member.user
+    chat_id = str(event.chat.id)
+
+    async with SessionLocal() as db:
+        row = (await db.execute(select(Welcome).where(Welcome.chat_id == chat_id))).scalars().first()
+
+    if row and row.enabled:
+        text = (row.text or "Welcome {name}").replace("{name}", user.full_name)
+        await bot.send_message(chat_id, text)
 
 # ================= WEBHOOK =================
-webhook_tasks = set()
-MAX_TASKS = 100
+async def process_update(update):
+    try:
+        await asyncio.wait_for(dp.feed_update(bot, update), timeout=10)
+    except Exception:
+        logging.exception("Update error")
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -228,39 +172,39 @@ async def webhook(req: Request):
     if len(webhook_tasks) > MAX_TASKS:
         return {"ok": True}
 
-    async def process():
-        try:
-            await dp.feed_update(bot, update)
-        except Exception:
-            logging.exception("Update error")
-
-    task = asyncio.create_task(process())
+    task = asyncio.create_task(process_update(update))
     webhook_tasks.add(task)
     task.add_done_callback(lambda t: webhook_tasks.discard(t))
 
     return {"ok": True}
 
-
 @app.get("/")
 async def root():
-    return {"status": "running"}
-
+    return {"ok": True}
 
 # ================= STARTUP =================
+async def wait_for_db():
+    for _ in range(10):
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(sql_text("SELECT 1"))
+            return
+        except:
+            await asyncio.sleep(2)
+
 @app.on_event("startup")
 async def startup():
+    await wait_for_db()
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-    asyncio.create_task(auto_worker())
 
     webhook_url = f"{BASE_URL}/webhook"
 
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(webhook_url)
 
-    logging.info(f"Webhook set: {webhook_url}")
-
+    asyncio.create_task(auto_worker())
 
 # ================= SHUTDOWN =================
 @app.on_event("shutdown")
@@ -276,4 +220,4 @@ async def shutdown():
 # ================= RUN =================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("
