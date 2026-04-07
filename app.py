@@ -1,47 +1,61 @@
-import os
-import time
-import asyncio
-import logging
-
-from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
-
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import Update
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-
-from sqlalchemy import Column, Integer, String, Text, select
+import os, asyncio, time, contextlib
+from fastapi import FastAPI, Request
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base
+from sqlalchemy import Column, Integer, String, Text, select, delete
+from dotenv import load_dotenv
 
-# ======================
-# BASIC
-# ======================
-logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
 BASE_URL = os.getenv("BASE_URL")
-SECRET = os.getenv("WEBHOOK_SECRET", "secret123")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not BOT_TOKEN or not BASE_URL or not DATABASE_URL:
-    raise RuntimeError("Missing ENV")
-
-WEBHOOK_PATH = f"/webhook/{SECRET}"
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
-
-# ======================
-# DB
-# ======================
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://")
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+app = FastAPI()
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
+
+# ======================
+# STATE
+# ======================
+user_state = {}
+temp = {}
+last_sent = {}
+
+def reset(uid):
+    user_state.pop(uid, None)
+    temp.pop(uid, None)
+
+# ======================
+# BUTTON
+# ======================
+def parse_buttons(text):
+    if not text:
+        return None
+    rows = []
+    for line in text.split("\n"):
+        row = []
+        for part in line.split("&&"):
+            if "-" in part:
+                t, u = part.split("-", 1)
+                row.append({"text": t.strip(), "url": u.strip()})
+        if row:
+            rows.append(row)
+    return rows
+
+def build_buttons(data):
+    if not data:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=b["text"], url=b["url"]) for b in row]
+        for row in data
+    ])
 
 # ======================
 # MODELS
@@ -51,135 +65,134 @@ class Keyword(Base):
     id = Column(Integer, primary_key=True)
     key = Column(String, unique=True)
     text = Column(Text)
-    mode = Column(String, default="contains")
+    image = Column(Text)
+    button = Column(Text)
 
 class AutoPost(Base):
     __tablename__ = "auto_post"
     id = Column(Integer, primary_key=True)
     chat_id = Column(String)
     text = Column(Text)
+    image = Column(Text)
+    button = Column(Text)
     interval = Column(Integer, default=10)
-    last_sent = Column(Integer, default=0)
+    is_active = Column(Integer, default=0)
+    pin = Column(Integer, default=0)
 
 # ======================
-# BOT
+# MENU
 # ======================
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-
-# ======================
-# AI MEMORY
-# ======================
-memory = {}
-
-async def ai_reply(user_id, text):
-    import openai
-    openai.api_key = os.getenv("OPENAI_KEY")
-
-    ctx = memory.get(user_id, [])
-    ctx.append({"role": "user", "content": text})
-
-    res = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=ctx[-10:]
-    )
-
-    reply = res.choices[0].message.content
-    ctx.append({"role": "assistant", "content": reply})
-    memory[user_id] = ctx
-
-    return reply
+def home():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📌 Từ khoá", callback_data="kw_menu")],
+        [InlineKeyboardButton(text="📅 Auto Post", callback_data="auto_menu")]
+    ])
 
 # ======================
-# HANDLER
+# HELPERS
+# ======================
+async def send_preview(chat_id, text=None, image=None, button=None):
+    kb = build_buttons(parse_buttons(button))
+    if image:
+        return await bot.send_photo(chat_id, image, caption=text or "", reply_markup=kb)
+    return await bot.send_message(chat_id, text or " ", reply_markup=kb)
+
+def get_image(m: types.Message):
+    if m.photo:
+        return m.photo[-1].file_id
+    if m.text:
+        return m.text.strip()
+    return None
+
+# ======================
+# START
+# ======================
+@dp.message(F.text == "/start")
+async def start(m: types.Message):
+    reset(m.from_user.id)
+    await m.answer("🚀 Menu", reply_markup=home())
+
+@dp.callback_query(F.data == "home")
+async def go_home(c: types.CallbackQuery):
+    await c.answer()
+    await c.message.edit_text("🚀 Menu", reply_markup=home())
+
+# ======================
+# KEYWORD AUTO REPLY
 # ======================
 @dp.message()
-async def handle_message(m: types.Message):
-    if not m.text:
-        return
+async def all_msg(m: types.Message):
+    uid = m.from_user.id
+    text = (m.text or "").strip().lower()
 
-    text = m.text.lower()
+    if not text or text.startswith("/"):
+        return
 
     async with SessionLocal() as db:
         kws = (await db.execute(select(Keyword))).scalars().all()
 
     for k in kws:
-        if (k.mode == "exact" and text == k.key) or (k.mode == "contains" and k.key in text):
-            await m.answer(k.text)
-            return
-
-    # AI fallback
-    reply = await ai_reply(m.from_user.id, text)
-    await m.answer(reply)
+        if k.key.lower() == text:
+            return await send_preview(
+                m.chat.id,
+                k.text,
+                k.image,
+                k.button
+            )
 
 # ======================
-# AUTO POST
+# AUTO WORKER (FIX INTERVAL)
 # ======================
 async def auto_worker():
     while True:
-        now = int(time.time())
+        now = time.time()
 
         async with SessionLocal() as db:
-            posts = (await db.execute(select(AutoPost))).scalars().all()
+            posts = (await db.execute(
+                select(AutoPost).where(AutoPost.is_active == 1)
+            )).scalars().all()
 
-            for p in posts:
-                if now - (p.last_sent or 0) > p.interval * 60:
+        for p in posts:
+            interval = max(p.interval, 1) * 60
+            last = last_sent.get(p.id, 0)
+
+            if now - last < interval:
+                continue
+
+            try:
+                msg = await send_preview(
+                    p.chat_id,
+                    p.text,
+                    p.image,
+                    p.button
+                )
+
+                last_sent[p.id] = now
+
+                if p.pin:
                     try:
-                        await bot.send_message(p.chat_id, p.text)
+                        await bot.pin_chat_message(p.chat_id, msg.message_id)
+                    except:
+                        pass
 
-                        p.last_sent = now
-                        await db.commit()
+            except Exception as e:
+                print("Auto lỗi:", e)
 
-                    except Exception as e:
-                        logging.error(e)
-
-        await asyncio.sleep(20)
-
-# ======================
-# APP
-# ======================
-app = FastAPI()
-
-# ======================
-# WEBSOCKET
-# ======================
-clients = []
-
-@app.websocket("/ws")
-async def ws(ws: WebSocket):
-    await ws.accept()
-    clients.append(ws)
-
-    try:
-        while True:
-            await ws.receive_text()
-    except:
-        clients.remove(ws)
-
-async def broadcast(data):
-    for c in clients:
-        try:
-            await c.send_json(data)
-        except:
-            pass
+        await asyncio.sleep(10)
 
 # ======================
 # WEBHOOK
 # ======================
-@app.post(WEBHOOK_PATH)
+@app.post("/webhook")
 async def webhook(req: Request):
-    try:
-        data = await req.json()
-        update = Update.model_validate(data)
-        await dp.feed_update(bot, update)
-    except Exception as e:
-        logging.error(e)
-
-    return JSONResponse({"ok": True})
+    data = await req.json()
+    update = types.Update.model_validate(data)  # FIX
+    await dp.feed_update(bot, update)
+    return {"ok": True}
 
 @app.get("/")
-async def home():
-    return {"status": "SaaS BOT RUNNING 🚀"}
+async def root():
+    return {"status": "ok"}
 
 # ======================
 # STARTUP
@@ -189,9 +202,15 @@ async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(WEBHOOK_URL)
-
     asyncio.create_task(auto_worker())
 
-    logging.info(f"Webhook: {WEBHOOK_URL}")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(f"{BASE_URL}/webhook")
+
+    print("READY")
+
+@app.on_event("shutdown")
+async def shutdown():
+    with contextlib.suppress(Exception):
+        await bot.delete_webhook()
+    await bot.session.close()
