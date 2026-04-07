@@ -42,6 +42,22 @@ if not BASE_URL:
 # DB
 # ======================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./bot.db")
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError("Missing DATABASE_URL")
+
+# Railway thường cho postgres://... (chỉ driver sync)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
