@@ -39,6 +39,9 @@ if not BOT_TOKEN:
 if not BASE_URL:
     raise RuntimeError("Missing BASE_URL")
 
+# ✅ FIX quan trọng: tránh set webhook thành ...//webhook
+BASE_URL = BASE_URL.rstrip("/")
+
 # ======================
 # DB (Postgres async)
 # ======================
@@ -46,7 +49,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
 
-# Railway thường cho postgres://... => đổi sang postgresql+asyncpg://...
+# Railway thường cho postgres://... => đổi sang asyncpg
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
@@ -92,7 +95,7 @@ class AutoPost(Base):
     text = Column(Text, default="")
     interval = Column(Integer, default=10)
 
-    # ✅ theo lỗi DB của bạn: last_sent và active tồn tại
+    # theo log trước bạn đã có cột last_sent và active
     last_sent = Column(Integer, default=0)
     active = Column(Integer, default=1)
 
@@ -105,19 +108,20 @@ dp = Dispatcher()
 app = FastAPI()
 
 # ======================
-# CACHE / PERMISSION
+# CACHE / STATE
 # ======================
 admin_cache = set()
 BOT_ID = None
 risk_notified_chats = set()
 init_sent_chats = set()
 
-# background tasks
-auto_worker_task: asyncio.Task | None = None
 stop_event = asyncio.Event()
 webhook_tasks: set[asyncio.Task] = set()
+auto_worker_task: asyncio.Task | None = None
 
-
+# ======================
+# AUTH
+# ======================
 def is_allowed(user_id: int):
     return user_id == OWNER_ID or user_id in admin_cache
 
@@ -130,7 +134,7 @@ async def load_admin():
 
 
 # ======================
-# HELPER
+# HELPER: send text/photo + inline buttons
 # ======================
 async def send_text(chat_id, text, reply_markup=None):
     return await bot.send_message(chat_id, text, reply_markup=reply_markup)
@@ -190,6 +194,7 @@ async def send_keyword_reply(chat_id: str, k: Keyword):
 # ======================
 @dp.message()
 async def auto_reply(m: types.Message):
+    # chỉ xử lý text
     if not m.text:
         return
 
@@ -233,7 +238,7 @@ async def auto_worker():
                     except Exception:
                         logging.exception("auto post error")
 
-            # ngủ 10s nhưng dừng nhanh khi stop_event set
+            # sleep 10s nhưng dừng nhanh khi stop_event set
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=10)
             except asyncio.TimeoutError:
@@ -278,7 +283,7 @@ async def group_has_bot_admin(chat_id: str) -> bool:
         admins = await bot.get_chat_administrators(chat_id)
     except Exception as e:
         logging.warning(f"Cannot get admins for chat {chat_id}: {e}")
-        return True  # tránh spam nếu không lấy được admin list
+        return True
 
     admin_ids = {a.user.id for a in admins if a.user}
     return len(admin_ids.intersection(required_ids)) > 0
@@ -302,12 +307,14 @@ async def on_user_join(event: types.ChatMemberUpdated):
     chat_id = str(event.chat.id)
 
     async with SessionLocal() as db:
-        w = (await db.execute(
-            select(WelcomeSetting).where(
-                WelcomeSetting.chat_id == chat_id,
-                WelcomeSetting.active == 1,
+        w = (
+            await db.execute(
+                select(WelcomeSetting).where(
+                    WelcomeSetting.chat_id == chat_id,
+                    WelcomeSetting.active == 1,
+                )
             )
-        )).scalars().first()
+        ).scalars().first()
 
     if not w or not (w.text or "").strip():
         return
@@ -457,14 +464,13 @@ async def root():
     return {"ok": True}
 
 
-# ✅ ADDED: Health endpoint (để Railway healthcheck không restart)
 @app.get("/health")
 async def health():
     return {"ok": True}
 
 
 # ======================
-# WEBHOOK (TRẢ RESPONSE NGAY)
+# WEBHOOK (trả nhanh)
 # ======================
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -472,7 +478,6 @@ async def webhook(req: Request):
         data = await req.json()
         update = types.Update.model_validate(data)
 
-        # chạy nền để Telegram không bị timeout / reset
         async def _run():
             try:
                 await dp.feed_update(bot, update)
@@ -481,29 +486,21 @@ async def webhook(req: Request):
 
         task = asyncio.create_task(_run())
         webhook_tasks.add(task)
-
-        def _done(_):
-            webhook_tasks.discard(task)
-
-        task.add_done_callback(_done)
+        task.add_done_callback(lambda t: webhook_tasks.discard(t))
 
     except Exception:
         logging.exception("Webhook payload parse error")
 
-    # luôn trả ok để Telegram không báo wrong response
+    # ✅ luôn trả 200 OK
     return {"ok": True}
 
 
 # ======================
 # STARTUP / SHUTDOWN
 # ======================
-auto_worker_task_ref: asyncio.Task | None = None
-stop_event: asyncio.Event  # đã có ở code bạn (đảm bảo khai báo global trước đó)
-webhook_tasks: set[asyncio.Task]  # đã có ở code bạn (đảm bảo khai báo global trước đó)
-
 @app.on_event("startup")
 async def startup():
-    global BOT_ID, auto_worker_task_ref
+    global BOT_ID, auto_worker_task
 
     logging.info("STARTUP: start")
 
@@ -514,44 +511,41 @@ async def startup():
 
     await load_admin()
 
-    # reset stop_event
     stop_event.clear()
 
-    # start worker
-    if auto_worker_task_ref is None or auto_worker_task_ref.done():
-        auto_worker_task_ref = asyncio.create_task(auto_worker())
+    if auto_worker_task is None or auto_worker_task.done():
+        auto_worker_task = asyncio.create_task(auto_worker())
 
-    # set webhook
+    # ✅ sử dụng BASE_URL đã rstrip("/")
     await bot.set_webhook(f"{BASE_URL}/webhook")
     logging.info(f"Webhook set: {BASE_URL}/webhook")
 
     logging.info("STARTUP: done")
 
+
 @app.on_event("shutdown")
 async def shutdown():
-    global auto_worker_task_ref
+    global auto_worker_task
 
     logging.info("SHUTDOWN: start")
 
-    # 1) cancel webhook background tasks
+    # cancel webhook tasks
     with contextlib.suppress(Exception):
         for t in list(webhook_tasks):
             t.cancel()
         webhook_tasks.clear()
 
-    # 2) stop worker quickly (không delete_webhook để giảm mạng call lúc shutdown)
-    try:
+    # stop worker
+    with contextlib.suppress(Exception):
         stop_event.set()
-    except Exception:
-        pass
 
-    if auto_worker_task_ref:
-        auto_worker_task_ref.cancel()
+    if auto_worker_task:
+        with contextlib.suppress(Exception):
+            auto_worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            # không await quá lâu để tránh bị Railway kill giữa chừng
-            await asyncio.wait_for(auto_worker_task_ref, timeout=3)
+            await auto_worker_task
 
-    # 3) close aiogram session/connector best-effort
+    # close aiogram session/connector
     with contextlib.suppress(Exception):
         await bot.session.close()
 
@@ -560,7 +554,6 @@ async def shutdown():
         if connector is not None:
             connector.close()
 
-    # 4) dispose db engine (best-effort)
     with contextlib.suppress(Exception):
         await engine.dispose()
 
