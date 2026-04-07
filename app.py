@@ -30,10 +30,16 @@ load_dotenv()
 def normalize_database_url(url: str | None) -> str:
     if not url:
         return "sqlite+aiosqlite:///bot.db"
+
+    # Nếu dán nhầm dạng postgres://... thì đổi đúng
     if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+
+    # Nếu dán nhầm dạng postgresql://... thì đổi đúng
     if url.startswith("postgresql://"):
-        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+    # Nếu đã đúng thì giữ nguyên
     return url
 
 
@@ -56,7 +62,10 @@ engine_kwargs = {"echo": False, "future": True}
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 else:
-    ssl_context = ssl.create_default_context()
+    # Railway / hosted Postgres hay gặp self-signed cert
+    # => bỏ verify certificate
+    ssl_context = ssl._create_unverified_context()
+
     engine_kwargs["pool_size"] = 10
     engine_kwargs["max_overflow"] = 20
     engine_kwargs["pool_timeout"] = 30
@@ -211,7 +220,7 @@ async def remove_admin_db(user_id: int):
     await load_admin_cache()
 
 
-def reset(uid: int):
+def reset(uid):
     user_state.pop(uid, None)
     temp.pop(uid, None)
 
