@@ -9,6 +9,8 @@ from fastapi.responses import HTMLResponse
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart
+from aiogram import F
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -39,8 +41,7 @@ if not BOT_TOKEN:
 if not BASE_URL:
     raise RuntimeError("Missing BASE_URL")
 
-# ✅ FIX quan trọng: tránh set webhook thành ...//webhook
-BASE_URL = BASE_URL.rstrip("/")
+BASE_URL = BASE_URL.rstrip("/")  # ✅ tránh ...//webhook
 
 # ======================
 # DB (Postgres async)
@@ -75,8 +76,8 @@ class Keyword(Base):
     id = Column(Integer, primary_key=True)
     key = Column(String, unique=True)
     text = Column(Text, default="")
-    image = Column(String, default="")
-    button = Column(Text, default="")
+    image = Column(String, default="")   # file_id hoặc url
+    button = Column(Text, default="")   # format string nhiều dòng
     active = Column(Integer, default=1)
 
 
@@ -93,10 +94,8 @@ class AutoPost(Base):
     id = Column(Integer, primary_key=True)
     chat_id = Column(String)
     text = Column(Text, default="")
-    interval = Column(Integer, default=10)
-
-    # theo log trước bạn đã có cột last_sent và active
-    last_sent = Column(Integer, default=0)
+    interval = Column(Integer, default=10)  # phút
+    last_sent = Column(Integer, default=0)  # ✅ đúng theo code trước + lỗi bạn gặp
     active = Column(Integer, default=1)
 
 
@@ -110,39 +109,26 @@ app = FastAPI()
 # ======================
 # CACHE / STATE
 # ======================
-admin_cache = set()
-BOT_ID = None
-risk_notified_chats = set()
-init_sent_chats = set()
+admin_cache: set[int] = set()
+keywords_cache: list[Keyword] = []
+BOT_ID: int | None = None
+
+risk_notified_chats: set[str] = set()
+init_sent_chats: set[str] = set()
 
 stop_event = asyncio.Event()
 webhook_tasks: set[asyncio.Task] = set()
+
 auto_worker_task: asyncio.Task | None = None
 
-# ======================
-# AUTH
-# ======================
-def is_allowed(user_id: int):
+
+def is_allowed(user_id: int) -> bool:
     return user_id == OWNER_ID or user_id in admin_cache
-
-
-async def load_admin():
-    global admin_cache
-    async with SessionLocal() as db:
-        rows = (await db.execute(select(AdminUser))).scalars().all()
-    admin_cache = {r.user_id for r in rows}
-
-
-# ======================
-# HELPER: send text/photo + inline buttons
-# ======================
-async def send_text(chat_id, text, reply_markup=None):
-    return await bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
 def parse_inline_buttons(button_str: str):
     """
-    Format bạn đang dùng:
+    Format bạn hay dùng:
       Dòng mới = hàng
       Trong 1 hàng: "Text - URL && Text2 - URL2"
     """
@@ -160,9 +146,9 @@ def parse_inline_buttons(button_str: str):
         for p in parts:
             if "-" not in p:
                 continue
-            text_part, url_part = p.split("-", 1)
-            t = text_part.strip()
-            u = url_part.strip()
+            t, u = p.split("-", 1)
+            t = t.strip()
+            u = u.strip()
             if not t or not u:
                 continue
             row_buttons.append(InlineKeyboardButton(text=t, url=u))
@@ -175,42 +161,71 @@ def parse_inline_buttons(button_str: str):
 
 
 async def send_keyword_reply(chat_id: str, k: Keyword):
+    """Gửi keyword reply theo text/image/button"""
     reply_markup = parse_inline_buttons(k.button)
     img = (k.image or "").strip()
     caption = (k.text or "").strip()
 
     if img:
-        return await bot.send_photo(
-            chat_id,
-            photo=img,
-            caption=caption or None,
-            reply_markup=reply_markup,
-        )
-    return await bot.send_message(chat_id, caption or "", reply_markup=reply_markup)
+        await bot.send_photo(chat_id, photo=img, caption=caption or None, reply_markup=reply_markup)
+    else:
+        await bot.send_message(chat_id, caption or "", reply_markup=reply_markup)
+
+
+async def load_admin_cache():
+    global admin_cache
+    async with SessionLocal() as db:
+        rows = (await db.execute(select(AdminUser))).scalars().all()
+    admin_cache = {r.user_id for r in rows}
+    logging.info(f"Loaded admins: {len(admin_cache)}")
+
+
+async def load_keywords_cache():
+    global keywords_cache
+    async with SessionLocal() as db:
+        rows = (await db.execute(select(Keyword).where(Keyword.active == 1))).scalars().all()
+    keywords_cache = rows
+    logging.info(f"Loaded active keywords: {len(keywords_cache)}")
 
 
 # ======================
-# KEYWORD AUTO REPLY
+# KEYWORD AUTO REPLY (CHỈ nhận text)
 # ======================
-@dp.message()
-async def auto_reply(m: types.Message):
-    # chỉ xử lý text
-    if not m.text:
-        return
-
-    text = m.text or ""
+@dp.message(F.text)
+async def on_text(m: types.Message):
+    text = (m.text or "")
     chat_id = str(m.chat.id)
 
-    async with SessionLocal() as db:
-        kws = (await db.execute(select(Keyword).where(Keyword.active == 1))).scalars().all()
+    # skip /start for safety
+    if text.strip() == "/start":
+        return
 
-    for k in kws:
-        if (k.key or "").lower() in text.lower():
-            try:
-                await send_keyword_reply(chat_id, k)
-            except Exception:
-                logging.exception("keyword send error")
-            break
+    if not keywords_cache:
+        logging.info(f"[DEBUG] No active keywords in cache. message={text!r}")
+        return
+
+    text_low = text.lower()
+
+    # contains match (chuẩn code bạn đang làm)
+    for k in keywords_cache:
+        if (k.key or "").lower() in text_low:
+            logging.info(f"[DEBUG] Matched keyword: id={k.id} key={k.key!r}")
+            await send_keyword_reply(chat_id, k)
+            return
+
+    logging.info(f"[DEBUG] No keyword matched. message={text!r}")
+
+
+# ======================
+# START CMD
+# ======================
+@dp.message(CommandStart())
+async def start_cmd(m: types.Message):
+    if not m.from_user:
+        return
+    if not is_allowed(m.from_user.id):
+        return await m.answer("❌ Không có quyền")
+    return await m.answer("🏠 Bot ready")
 
 
 # ======================
@@ -224,21 +239,23 @@ async def auto_worker():
             async with SessionLocal() as db:
                 posts = (await db.execute(select(AutoPost).where(AutoPost.active == 1))).scalars().all()
 
+            if posts:
+                logging.info(f"[AUTO] active posts={len(posts)} now={now}")
+
             for p in posts:
                 last = p.last_sent or 0
                 if now - last >= (p.interval * 60):
                     try:
-                        await send_text(p.chat_id, p.text or "")
-
+                        await bot.send_message(p.chat_id, p.text or "")
                         async with SessionLocal() as db2:
                             row = await db2.get(AutoPost, p.id)
                             if row:
                                 row.last_sent = now
                                 await db2.commit()
+                        logging.info(f"[AUTO] Sent post id={p.id} chat_id={p.chat_id}")
                     except Exception:
                         logging.exception("auto post error")
 
-            # sleep 10s nhưng dừng nhanh khi stop_event set
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=10)
             except asyncio.TimeoutError:
@@ -307,23 +324,21 @@ async def on_user_join(event: types.ChatMemberUpdated):
     chat_id = str(event.chat.id)
 
     async with SessionLocal() as db:
-        w = (
-            await db.execute(
-                select(WelcomeSetting).where(
-                    WelcomeSetting.chat_id == chat_id,
-                    WelcomeSetting.active == 1,
-                )
+        w = (await db.execute(
+            select(WelcomeSetting).where(
+                WelcomeSetting.chat_id == chat_id,
+                WelcomeSetting.active == 1
             )
-        ).scalars().first()
+        )).scalars().first()
 
     if not w or not (w.text or "").strip():
+        logging.info(f"[WELCOME] No welcome config for chat_id={chat_id}")
         return
 
     group_title = event.chat.title or ""
     name = (u.full_name or u.username or "VIP").strip()
 
-    welcome_text = (w.text or "")
-    welcome_text = welcome_text.replace("{name}", name).replace("{group}", group_title)
+    welcome_text = (w.text or "").replace("{name}", name).replace("{group}", group_title)
 
     try:
         await bot.send_message(chat_id, welcome_text, reply_markup=build_welcome_keyboard())
@@ -338,7 +353,7 @@ async def on_bot_join(event: types.ChatMemberUpdated):
 
     chat_id = str(event.chat.id)
 
-    # init message (avoid repeat)
+    # init message
     if chat_id not in init_sent_chats:
         init_text = "组防骗助手为您服务,我正在进行相关初始化配置请稍后"
         try:
@@ -347,7 +362,7 @@ async def on_bot_join(event: types.ChatMemberUpdated):
             logging.exception("init send error")
         init_sent_chats.add(chat_id)
 
-    # risk warning (avoid repeat)
+    # risk warning
     if chat_id not in risk_notified_chats:
         ok = await group_has_bot_admin(chat_id)
         if not ok:
@@ -360,27 +375,9 @@ async def on_bot_join(event: types.ChatMemberUpdated):
 
 
 # ======================
-# START CMD
-# ======================
-from aiogram.filters import Command
-
-@dp.message(Command("start"))
-async def start_cmd(m:
-    if not m.text:
-        return
-    if m.text.strip() != "/start":
-        return
-    if not m.from_user:
-        return
-    if not is_allowed(m.from_user.id):
-        return await m.answer("❌ Không có quyền")
-    return await m.answer("🏠 Bot ready")
-
-
-# ======================
 # WEB ADMIN PANEL
 # ======================
-def check_key(key):
+def check_key(key: str):
     return key == WEB_ADMIN_KEY
 
 
@@ -400,7 +397,6 @@ def render_page(admins, key):
             </td>
         </tr>
         """
-
     return f"""
     <html>
     <body>
@@ -423,6 +419,16 @@ def render_page(admins, key):
     """
 
 
+@app.get("/", include_in_schema=False)
+async def root():
+    return {"ok": True}
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page(key: str = ""):
     if not check_key(key):
@@ -443,7 +449,7 @@ async def add_admin(key: str = Form(""), user_id: int = Form(...), note: str = F
         db.add(AdminUser(user_id=user_id, note=note, created_at=int(time.time())))
         await db.commit()
 
-    await load_admin()
+    await load_admin_cache()
     return HTMLResponse("OK")
 
 
@@ -456,22 +462,12 @@ async def del_admin(key: str = Form(""), user_id: int = Form(...)):
         await db.execute(delete(AdminUser).where(AdminUser.user_id == user_id))
         await db.commit()
 
-    await load_admin()
+    await load_admin_cache()
     return HTMLResponse("Deleted")
 
 
-@app.get("/")
-async def root():
-    return {"ok": True}
-
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-
 # ======================
-# WEBHOOK (trả nhanh)
+# WEBHOOK (TRẢ RESPONSE NGAY)
 # ======================
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -486,13 +482,13 @@ async def webhook(req: Request):
                 logging.exception("dp.feed_update failed")
 
         task = asyncio.create_task(_run())
-        webhook_tasks.add(task)
-        task.add_done_callback(lambda t: webhook_tasks.discard(t))
-
     except Exception:
         logging.exception("Webhook payload parse error")
+        return {"ok": True}
 
-    # ✅ luôn trả 200 OK
+    # track task (để cancel khi shutdown)
+    webhook_tasks.add(task)
+    task.add_done_callback(lambda t: webhook_tasks.discard(t))
     return {"ok": True}
 
 
@@ -504,39 +500,33 @@ async def startup():
     global BOT_ID, auto_worker_task
 
     logging.info("STARTUP: start")
-
     BOT_ID = (await bot.get_me()).id
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    await load_admin()
+    await load_admin_cache()
+    await load_keywords_cache()
 
     stop_event.clear()
 
     if auto_worker_task is None or auto_worker_task.done():
         auto_worker_task = asyncio.create_task(auto_worker())
 
-    # ✅ sử dụng BASE_URL đã rstrip("/")
     await bot.set_webhook(f"{BASE_URL}/webhook")
     logging.info(f"Webhook set: {BASE_URL}/webhook")
-
     logging.info("STARTUP: done")
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    global auto_worker_task
-
     logging.info("SHUTDOWN: start")
 
-    # cancel webhook tasks
     with contextlib.suppress(Exception):
         for t in list(webhook_tasks):
             t.cancel()
         webhook_tasks.clear()
 
-    # stop worker
     with contextlib.suppress(Exception):
         stop_event.set()
 
@@ -546,15 +536,11 @@ async def shutdown():
         with contextlib.suppress(asyncio.CancelledError):
             await auto_worker_task
 
-    # close aiogram session/connector
+    with contextlib.suppress(Exception):
+        await bot.delete_webhook()
+
     with contextlib.suppress(Exception):
         await bot.session.close()
-
-    with contextlib.suppress(Exception):
-        connector = getattr(bot.session, "_connector", None)
-        if connector is not None:
-            connector.close()
-
     with contextlib.suppress(Exception):
         await engine.dispose()
 
