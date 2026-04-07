@@ -46,7 +46,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
 
-# Railway postgres thường là postgres://... => chuyển sang asyncpg
+# Railway postgres -> asyncpg
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
@@ -92,9 +92,10 @@ class AutoPost(Base):
     text = Column(Text, default="")
     interval = Column(Integer, default=10)
 
-    # ✅ dùng đúng tên cột theo lỗi bạn gặp
+    # dùng cột last_sent (theo log hint của bạn)
     last_sent = Column(Integer, default=0)
 
+    # dùng cột active (theo log hint của bạn)
     active = Column(Integer, default=1)
 
 
@@ -112,9 +113,15 @@ BOT_ID = None
 risk_notified_chats = set()
 init_sent_chats = set()
 
+# ======================
+# BACKGROUND WORKER (graceful stop)
+# ======================
 auto_worker_task: asyncio.Task | None = None
+stop_event = asyncio.Event()
 
-
+# ======================
+# helpers
+# ======================
 def is_allowed(user_id: int):
     return user_id == OWNER_ID or user_id in admin_cache
 
@@ -126,19 +133,11 @@ async def load_admin():
     admin_cache = {r.user_id for r in rows}
 
 
-# ======================
-# HELPER: send text/photo + inline buttons
-# ======================
 async def send_text(chat_id, text, reply_markup=None):
     return await bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
 def parse_inline_buttons(button_str: str):
-    """
-    Format bạn hay dùng:
-      Dòng mới = hàng
-      Trong 1 hàng: "Text - URL && Text2 - URL2"
-    """
     if not button_str:
         return None
 
@@ -169,7 +168,6 @@ def parse_inline_buttons(button_str: str):
 
 async def send_keyword_reply(chat_id: str, k: Keyword):
     reply_markup = parse_inline_buttons(k.button)
-
     img = (k.image or "").strip()
     caption = (k.text or "").strip()
 
@@ -184,7 +182,7 @@ async def send_keyword_reply(chat_id: str, k: Keyword):
 
 
 # ======================
-# KEYWORD AUTO REPLY (realtime)
+# KEYWORD AUTO REPLY
 # ======================
 @dp.message()
 async def auto_reply(m: types.Message):
@@ -210,27 +208,38 @@ async def auto_reply(m: types.Message):
 # AUTO POST WORKER
 # ======================
 async def auto_worker():
-    while True:
-        now = int(time.time())
+    try:
+        while not stop_event.is_set():
+            now = int(time.time())
 
-        async with SessionLocal() as db:
-            posts = (await db.execute(select(AutoPost).where(AutoPost.active == 1))).scalars().all()
+            async with SessionLocal() as db:
+                posts = (await db.execute(select(AutoPost).where(AutoPost.active == 1))).scalars().all()
 
-        for p in posts:
-            last = p.last_sent or 0
-            if now - last >= (p.interval * 60):
-                try:
-                    await send_text(p.chat_id, p.text or "")
+            for p in posts:
+                last = p.last_sent or 0
+                if now - last >= (p.interval * 60):
+                    try:
+                        await send_text(p.chat_id, p.text or "")
 
-                    async with SessionLocal() as db2:
-                        row = await db2.get(AutoPost, p.id)
-                        if row:
-                            row.last_sent = now
-                            await db2.commit()
-                except Exception:
-                    logging.exception("auto post error")
+                        async with SessionLocal() as db2:
+                            row = await db2.get(AutoPost, p.id)
+                            if row:
+                                row.last_sent = now
+                                await db2.commit()
+                    except Exception:
+                        logging.exception("auto post error")
 
-        await asyncio.sleep(10)
+            # ngủ 10s nhưng vẫn thoát nhanh khi stop_event set
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
+
+    except asyncio.CancelledError:
+        # cho phép cancel ngay khi shutdown
+        pass
+    except Exception:
+        logging.exception("auto_worker crashed")
 
 
 # ======================
@@ -262,7 +271,7 @@ async def group_has_bot_admin(chat_id: str) -> bool:
         admins = await bot.get_chat_administrators(chat_id)
     except Exception as e:
         logging.warning(f"Cannot get admins for chat {chat_id}: {e}")
-        return True  # tránh spam nếu không lấy được
+        return True
 
     admin_ids = {a.user.id for a in admins if a.user}
     return len(admin_ids.intersection(required_ids)) > 0
@@ -315,7 +324,6 @@ async def on_bot_join(event: types.ChatMemberUpdated):
 
     chat_id = str(event.chat.id)
 
-    # init message
     if chat_id not in init_sent_chats:
         init_text = "组防骗助手为您服务,我正在进行相关初始化配置请稍后"
         try:
@@ -324,7 +332,6 @@ async def on_bot_join(event: types.ChatMemberUpdated):
             logging.exception("init send error")
         init_sent_chats.add(chat_id)
 
-    # risk warning
     if chat_id not in risk_notified_chats:
         ok = await group_has_bot_admin(chat_id)
         if not ok:
@@ -409,11 +416,7 @@ async def admin_page(key: str = ""):
 
 
 @app.post("/admin/add", response_class=HTMLResponse)
-async def add_admin(
-    key: str = Form(""),
-    user_id: int = Form(...),
-    note: str = Form("")
-):
+async def add_admin(key: str = Form(""), user_id: int = Form(...), note: str = Form("")):
     if not check_key(key):
         return HTMLResponse("403", status_code=403)
 
@@ -448,17 +451,13 @@ async def health():
 # ======================
 @app.post("/webhook")
 async def webhook(req: Request):
-    """
-    ✅ Fix cho 'Wrong response':
-    - Luôn trả về JSON {"ok": True} dù dp.feed_update có lỗi.
-    - Logging lỗi gốc để bạn debug.
-    """
     try:
         data = await req.json()
         update = types.Update.model_validate(data)
         await dp.feed_update(bot, update)
     except Exception:
         logging.exception("Webhook processing error")
+    # luôn trả ok để Telegram không báo wrong response
     return {"ok": True}
 
 
@@ -467,7 +466,7 @@ async def webhook(req: Request):
 # ======================
 @app.on_event("startup")
 async def startup():
-    global BOT_ID, auto_worker_task
+    global BOT_ID, auto_worker_task, stop_event
 
     BOT_ID = (await bot.get_me()).id
 
@@ -476,7 +475,11 @@ async def startup():
 
     await load_admin()
 
-    auto_worker_task = asyncio.create_task(auto_worker())
+    # reset stop_event
+    stop_event.clear()
+
+    if auto_worker_task is None or auto_worker_task.done():
+        auto_worker_task = asyncio.create_task(auto_worker())
 
     await bot.set_webhook(f"{BASE_URL}/webhook")
     logging.info(f"Webhook set: {BASE_URL}/webhook")
@@ -486,17 +489,38 @@ async def startup():
 async def shutdown():
     global auto_worker_task
 
+    # stop worker gracefully
+    try:
+        stop_event.set()
+    except Exception:
+        pass
+
     if auto_worker_task:
-        auto_worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await auto_worker_task
+        try:
+            await asyncio.wait_for(auto_worker_task, timeout=5)
+        except asyncio.TimeoutError:
+            auto_worker_task.cancel()
+            with contextlib.suppress(Exception):
+                await auto_worker_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logging.exception("auto_worker shutdown error")
 
-    try:
+    # delete webhook best-effort
+    with contextlib.suppress(Exception):
         await bot.delete_webhook()
-    except Exception:
-        pass
 
-    try:
+    # close aiogram aiohttp session + connector
+    with contextlib.suppress(Exception):
         await bot.session.close()
-    except Exception:
-        pass
+
+    # extra: close internal connector if exists
+    with contextlib.suppress(Exception):
+        connector = getattr(bot.session, "_connector", None)
+        if connector is not None:
+            connector.close()
+
+    # dispose sqlalchemy engine (không bắt buộc nhưng sạch sẽ)
+    with contextlib.suppress(Exception):
+        await engine.dispose()
