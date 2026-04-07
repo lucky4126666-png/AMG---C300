@@ -297,9 +297,10 @@ async def root():
 # ================= START =================
 @app.on_event("startup")
 async def startup():
+    await wait_db()
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(f"{BASE_URL}/webhook")
 
