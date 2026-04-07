@@ -1,9 +1,7 @@
 import os
-import ssl
 import time
 import asyncio
 import logging
-from datetime import datetime
 
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
@@ -25,14 +23,18 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN")
-SECRET = os.getenv("WEBHOOK_SECRET", "secret123")
+BASE_URL = os.getenv("BASE_URL")  # ⚠️ đổi sang BASE_URL
 
-WEBHOOK_PATH = f"/webhook/{SECRET}"
-WEBHOOK_URL = f"https://{DOMAIN}{WEBHOOK_PATH}"
+SECRET = os.getenv("WEBHOOK_SECRET", "secret123")
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
+
+if not BASE_URL:
+    raise RuntimeError("Missing BASE_URL")
+
+WEBHOOK_PATH = f"/webhook/{SECRET}"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 # ======================
 # DB
@@ -107,21 +109,21 @@ async def handle_message(m: types.Message):
 
     text = m.text.lower()
 
-    # keyword
     for k in keyword_cache:
         if (k.mode == "exact" and text == k.key) or (k.mode == "contains" and k.key in text):
             await m.answer(k.text)
             return
 
 # ======================
-# WELCOME
+# WELCOME FIX
 # ======================
-@dp.message(types.ChatMemberUpdated)
+@dp.chat_member()
 async def welcome(event: types.ChatMemberUpdated):
-    if event.chat.id:
-        w = welcome_cache.get(str(event.chat.id))
+    if event.new_chat_member.status == "member":
+        chat_id = str(event.chat.id)
+        w = welcome_cache.get(chat_id)
         if w:
-            await bot.send_message(event.chat.id, w.text or "Welcome!")
+            await bot.send_message(chat_id, w.text or "Welcome!")
 
 # ======================
 # WEBHOOK
@@ -133,21 +135,9 @@ async def webhook(req: Request):
     await dp.feed_update(bot, update)
     return {"ok": True}
 
-# ======================
-# ADMIN API
-# ======================
 @app.get("/")
 async def home():
     return {"status": "running"}
-
-@app.post("/add_keyword")
-async def add_keyword(req: Request):
-    data = await req.json()
-    async with SessionLocal() as db:
-        db.add(Keyword(key=data["key"], text=data["text"]))
-        await db.commit()
-    await load_cache()
-    return {"ok": True}
 
 # ======================
 # AUTO WORKER
@@ -181,6 +171,8 @@ async def startup():
         await conn.run_sync(Base.metadata.create_all)
 
     await load_cache()
+
+    await bot.delete_webhook(drop_pending_updates=True)  # ⚠️ FIX
     await bot.set_webhook(WEBHOOK_URL)
 
     asyncio.create_task(auto_worker())
