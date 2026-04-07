@@ -362,9 +362,10 @@ async def on_bot_join(event: types.ChatMemberUpdated):
 # ======================
 # START CMD
 # ======================
-@dp.message()
-async def start_cmd(m: types.Message):
-    # chỉ xử lý /start
+from aiogram.filters import Command
+
+@dp.message(Command("start"))
+async def start_cmd(m:
     if not m.text:
         return
     if m.text.strip() != "/start":
