@@ -1,11 +1,3 @@
-# FULL PRO MAX VERSION (100% UI LIKE ORIGINAL + OPTIMIZED)
-# Features:
-# - Full inline UI (keyword / welcome / auto / admin / group)
-# - Edit / delete / preview bằng button
-# - Cache toàn bộ
-# - Anti spam
-# - Không lag, production ready
-
 import os
 import time
 import asyncio
