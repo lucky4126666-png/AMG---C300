@@ -498,11 +498,14 @@ async def webhook(req: Request):
 # STARTUP / SHUTDOWN
 # ======================
 auto_worker_task_ref: asyncio.Task | None = None
-
+stop_event: asyncio.Event  # đã có ở code bạn (đảm bảo khai báo global trước đó)
+webhook_tasks: set[asyncio.Task]  # đã có ở code bạn (đảm bảo khai báo global trước đó)
 
 @app.on_event("startup")
 async def startup():
     global BOT_ID, auto_worker_task_ref
+
+    logging.info("STARTUP: start")
 
     BOT_ID = (await bot.get_me()).id
 
@@ -511,26 +514,32 @@ async def startup():
 
     await load_admin()
 
-    # stop_event reset
+    # reset stop_event
     stop_event.clear()
 
+    # start worker
     if auto_worker_task_ref is None or auto_worker_task_ref.done():
         auto_worker_task_ref = asyncio.create_task(auto_worker())
 
+    # set webhook
     await bot.set_webhook(f"{BASE_URL}/webhook")
     logging.info(f"Webhook set: {BASE_URL}/webhook")
 
+    logging.info("STARTUP: done")
 
 @app.on_event("shutdown")
 async def shutdown():
     global auto_worker_task_ref
 
-    # stop webhook background tasks
-    for t in list(webhook_tasks):
-        t.cancel()
-    webhook_tasks.clear()
+    logging.info("SHUTDOWN: start")
 
-    # stop worker
+    # 1) cancel webhook background tasks
+    with contextlib.suppress(Exception):
+        for t in list(webhook_tasks):
+            t.cancel()
+        webhook_tasks.clear()
+
+    # 2) stop worker quickly (không delete_webhook để giảm mạng call lúc shutdown)
     try:
         stop_event.set()
     except Exception:
@@ -539,13 +548,10 @@ async def shutdown():
     if auto_worker_task_ref:
         auto_worker_task_ref.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await auto_worker_task_ref
+            # không await quá lâu để tránh bị Railway kill giữa chừng
+            await asyncio.wait_for(auto_worker_task_ref, timeout=3)
 
-    # delete webhook best-effort
-    with contextlib.suppress(Exception):
-        await bot.delete_webhook()
-
-    # close aiogram session/connector best-effort
+    # 3) close aiogram session/connector best-effort
     with contextlib.suppress(Exception):
         await bot.session.close()
 
@@ -554,5 +560,8 @@ async def shutdown():
         if connector is not None:
             connector.close()
 
+    # 4) dispose db engine (best-effort)
     with contextlib.suppress(Exception):
         await engine.dispose()
+
+    logging.info("SHUTDOWN: done")
