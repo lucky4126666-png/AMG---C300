@@ -1,5 +1,6 @@
 import os
 import re
+import ssl
 import time
 import asyncio
 import contextlib
@@ -47,24 +48,32 @@ ADMIN_IDS = {
 if not BOT_TOKEN:
     raise RuntimeError("Thiếu BOT_TOKEN trong .env")
 
+# ======================
+# DB ENGINE
+# ======================
 engine_kwargs = {"echo": False, "future": True}
+
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 else:
+    ssl_context = ssl.create_default_context()
     engine_kwargs["pool_size"] = 10
     engine_kwargs["max_overflow"] = 20
     engine_kwargs["pool_timeout"] = 30
     engine_kwargs["pool_recycle"] = 1800
+    engine_kwargs["connect_args"] = {"ssl": ssl_context}
 
 engine = create_async_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
+# ======================
+# BOT
+# ======================
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
-
 dp = Dispatcher()
 
 # ======================
