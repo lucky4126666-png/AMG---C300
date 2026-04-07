@@ -1,163 +1,203 @@
 # =========================================
-# 🚀 TELEGRAM BOT PRO (FULL CLEAN BUILD)
-# Stable - Scalable - SaaS Ready
+# 🚀 TELEGRAM GROUP MANAGER PRO (ALL IN ONE)
 # =========================================
 
-import os
-import time
-import asyncio
-import logging
-
+import os, time, asyncio, logging, jwt, random
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 
+from fastapi import FastAPI, Request, WebSocket, Depends, Header, HTTPException
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy import Column, Integer, String, Text, select
-from sqlalchemy import text as sql_text
+from passlib.context import CryptContext
 
 # ================= CONFIG =================
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+SECRET_KEY = os.getenv("SECRET_KEY", "secret")
 
 if not BOT_TOKEN or not BASE_URL or not DATABASE_URL:
     raise RuntimeError("Missing ENV")
 
 BASE_URL = BASE_URL.rstrip("/")
 
-# ================= DATABASE =================
+# ================= DB =================
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 
-engine = create_async_engine(
-    DATABASE_URL,
-    pool_size=5,
-    max_overflow=10,
-    pool_timeout=30,
-    pool_recycle=1800,
-    pool_pre_ping=True,
-)
-
+engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
 @asynccontextmanager
 async def get_db():
-    async with SessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
+    async with SessionLocal() as db:
+        yield db
 
 # ================= MODELS =================
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    username = Column(String, unique=True)
+    password = Column(String)
+
+class Group(Base):
+    __tablename__ = "groups"
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(String)
+    title = Column(String)
+    active = Column(Integer, default=1)
+
 class Keyword(Base):
-    __tablename__ = "keywords"
+    __tablename__ = "keyword"
     id = Column(Integer, primary_key=True)
     key = Column(String)
     text = Column(Text)
 
 class AutoPost(Base):
-    __tablename__ = "auto_posts"
+    __tablename__ = "auto_post"
     id = Column(Integer, primary_key=True)
-    chat_id = Column(String)
     text = Column(Text)
     interval = Column(Integer, default=60)
     last_sent = Column(Integer, default=0)
-    active = Column(Integer, default=1)
+
+class AutoPostGroup(Base):
+    __tablename__ = "auto_post_group"
+    id = Column(Integer, primary_key=True)
+    post_id = Column(Integer)
+    group_id = Column(Integer)
 
 class Welcome(Base):
     __tablename__ = "welcome"
     id = Column(Integer, primary_key=True)
     chat_id = Column(String)
     text = Column(Text)
-    enabled = Column(Integer, default=1)
+
+# ================= AUTH =================
+pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_pw(p): return pwd.hash(p)
+def verify_pw(p, h): return pwd.verify(p, h)
+
+def create_token(uid):
+    return jwt.encode({"uid": uid, "exp": time.time()+86400}, SECRET_KEY, algorithm="HS256")
+
+def decode_token(t):
+    return jwt.decode(t, SECRET_KEY, algorithms=["HS256"])
+
+async def get_user(authorization: str = Header(None)):
+    try:
+        token = authorization.split(" ")[1]
+        return decode_token(token)["uid"]
+    except:
+        raise HTTPException(401)
 
 # ================= BOT =================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# ================= WS =================
+connections = []
+
+async def broadcast(data):
+    for c in connections:
+        try:
+            await c.send_json(data)
+        except:
+            pass
+
+# ================= FASTAPI =================
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 stop_event = asyncio.Event()
 
-# ================= MENU =================
-def main_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚙️ Auto Post", callback_data="menu_auto")],
-        [InlineKeyboardButton(text="🔑 Keyword", callback_data="menu_kw")],
-        [InlineKeyboardButton(text="👋 Welcome", callback_data="menu_wl")],
-    ])
-
-# ================= START =================
-@dp.message(CommandStart())
-async def start(m: types.Message):
-    await m.answer("🚀 BOT READY", reply_markup=main_menu())
-
-# ================= CALLBACK =================
-@dp.callback_query(F.data.startswith("menu_"))
-async def menu_handler(c: types.CallbackQuery):
-    if c.data == "menu_auto":
-        await c.message.answer("⚙️ Auto Post menu")
-    elif c.data == "menu_kw":
-        await c.message.answer("🔑 Keyword menu")
-    elif c.data == "menu_wl":
-        await c.message.answer("👋 Welcome menu")
-    await c.answer()
-
-# ================= KEYWORD =================
-@dp.message()
-async def keyword_handler(m: types.Message):
-    if not m.text or m.text.startswith("/"):
+# ================= GROUP AUTO SAVE =================
+@dp.my_chat_member()
+async def save_group(event: types.ChatMemberUpdated):
+    if event.new_chat_member.status not in ["member", "administrator"]:
         return
 
+    chat = event.chat
+
     async with get_db() as db:
-        row = (await db.execute(
-            select(Keyword).where(Keyword.key.ilike(f"%{m.text}%"))
+        exists = (await db.execute(
+            select(Group).where(Group.chat_id == str(chat.id))
         )).scalars().first()
 
-    if row:
-        await m.answer(row.text)
-    else:
-        await m.answer("🤖 Bot đang chạy...")
+        if not exists:
+            db.add(Group(chat_id=str(chat.id), title=chat.title))
+            await db.commit()
 
-# ================= AUTO WORKER =================
-async def auto_worker():
-    while not stop_event.is_set():
-        now = int(time.time())
+# ================= ADMIN ON/OFF =================
+@dp.message(F.text == "/off")
+async def off(m: types.Message):
+    chat_id = str(m.chat.id)
 
-        async with get_db() as db:
-            rows = (await db.execute(select(AutoPost))).scalars().all()
+    async with get_db() as db:
+        g = (await db.execute(
+            select(Group).where(Group.chat_id == chat_id)
+        )).scalars().first()
 
-        for p in rows:
-            if p.active and now - (p.last_sent or 0) >= p.interval * 60:
-                try:
-                    await bot.send_message(p.chat_id, p.text)
+        if g:
+            g.active = 0
+            await db.commit()
 
-                    async with get_db() as db:
-                        row = await db.get(AutoPost, p.id)
-                        row.last_sent = now
-                        await db.commit()
+    await m.answer("❌ Bot OFF")
 
-                except Exception as e:
-                    logging.error(e)
+@dp.message(F.text == "/on")
+async def on(m: types.Message):
+    chat_id = str(m.chat.id)
 
-        await asyncio.sleep(15)
+    async with get_db() as db:
+        g = (await db.execute(
+            select(Group).where(Group.chat_id == chat_id)
+        )).scalars().first()
+
+        if g:
+            g.active = 1
+            await db.commit()
+
+    await m.answer("✅ Bot ON")
+
+# ================= ANTI LINK =================
+@dp.message(F.text.contains("http"))
+async def anti_link(m: types.Message):
+    try:
+        await m.delete()
+    except:
+        pass
+
+# ================= KEYWORD SMART =================
+@dp.message(F.text)
+async def keyword(m: types.Message):
+    chat_id = str(m.chat.id)
+    text = m.text.lower()
+
+    async with get_db() as db:
+        g = (await db.execute(
+            select(Group).where(Group.chat_id == chat_id)
+        )).scalars().first()
+
+        if not g or not g.active:
+            return
+
+        rows = (await db.execute(select(Keyword))).scalars().all()
+
+    for row in rows:
+        keys = [k.strip() for k in row.key.split(",")]
+
+        for k in keys:
+            if k in text:
+                await m.answer(row.text)
+
+                await broadcast({
+                    "type": "keyword",
+                    "text": text
+                })
+                return
 
 # ================= WELCOME =================
 @dp.chat_member()
@@ -166,39 +206,92 @@ async def welcome(event: types.ChatMemberUpdated):
         return
 
     chat_id = str(event.chat.id)
-    user = event.new_chat_member.user
 
     async with get_db() as db:
-        row = (await db.execute(select(Welcome).where(Welcome.chat_id == chat_id))).scalars().first()
+        row = (await db.execute(
+            select(Welcome).where(Welcome.chat_id == chat_id)
+        )).scalars().first()
 
-    if row and row.enabled:
-        await bot.send_message(chat_id, row.text.replace("{name}", user.full_name))
+    if row:
+        await bot.send_message(chat_id, row.text)
+
+# ================= SAFE SEND =================
+async def safe_send(chat_id, text):
+    for _ in range(3):
+        try:
+            await bot.send_message(chat_id, text)
+            return True
+        except:
+            await asyncio.sleep(2)
+    return False
+
+# ================= AUTO WORKER =================
+async def auto_worker():
+    while not stop_event.is_set():
+        now = int(time.time())
+
+        async with get_db() as db:
+            posts = (await db.execute(select(AutoPost))).scalars().all()
+
+        for p in posts:
+            if now - (p.last_sent or 0) >= p.interval * 60:
+
+                async with get_db() as db:
+                    links = (await db.execute(
+                        select(AutoPostGroup).where(AutoPostGroup.post_id == p.id)
+                    )).scalars().all()
+
+                for link in links:
+                    async with get_db() as db:
+                        g = await db.get(Group, link.group_id)
+
+                    if not g or not g.active:
+                        continue
+
+                    await asyncio.sleep(random.randint(2, 5))
+
+                    ok = await safe_send(g.chat_id, p.text)
+
+                    if ok:
+                        await broadcast({
+                            "type": "auto_post",
+                            "group": g.chat_id
+                        })
+
+                async with get_db() as db:
+                    row = await db.get(AutoPost, p.id)
+                    row.last_sent = now
+                    await db.commit()
+
+        await asyncio.sleep(10)
 
 # ================= WEBHOOK =================
 @app.post("/webhook")
 async def webhook(req: Request):
-    update = types.Update.model_validate(await req.json())
+    data = await req.json()
+    update = types.Update.model_validate(data)
     await dp.feed_update(bot, update)
     return {"ok": True}
 
+# ================= WS =================
+@app.websocket("/ws")
+async def ws(ws: WebSocket):
+    await ws.accept()
+    connections.append(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except:
+        connections.remove(ws)
+
+# ================= ROOT =================
 @app.get("/")
 async def root():
-    return {"ok": True}
+    return {"status": "running"}
 
-# ================= STARTUP =================
-async def wait_db():
-    for _ in range(10):
-        try:
-            async with engine.begin() as conn:
-                await conn.execute(sql_text("SELECT 1"))
-            return
-        except:
-            await asyncio.sleep(2)
-
+# ================= START =================
 @app.on_event("startup")
 async def startup():
-    await wait_db()
-
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -207,13 +300,10 @@ async def startup():
 
     asyncio.create_task(auto_worker())
 
-# ================= SHUTDOWN =================
+    logging.info("🚀 BOT READY")
+
+# ================= STOP =================
 @app.on_event("shutdown")
 async def shutdown():
     stop_event.set()
     await bot.session.close()
-
-# ================= RUN =================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
