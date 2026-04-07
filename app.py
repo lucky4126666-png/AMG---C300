@@ -2,14 +2,14 @@ import os
 import time
 import asyncio
 import logging
-from datetime import datetime
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, WebSocket
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode
+from aiogram import Bot, Dispatcher, types
 from aiogram.types import Update
+from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
 from sqlalchemy import Column, Integer, String, Text, select
@@ -17,44 +17,30 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import declarative_base
 
 # ======================
-# CONFIG
+# BASIC
 # ======================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
+logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+BASE_URL = os.getenv("BASE_URL")
 SECRET = os.getenv("WEBHOOK_SECRET", "secret123")
 
-if not BOT_TOKEN or not DATABASE_URL or not DOMAIN:
-    raise RuntimeError("Missing ENV variables")
+if not BOT_TOKEN or not BASE_URL or not DATABASE_URL:
+    raise RuntimeError("Missing ENV")
 
 WEBHOOK_PATH = f"/webhook/{SECRET}"
-WEBHOOK_URL = f"https://{DOMAIN}{WEBHOOK_PATH}"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 # ======================
-# DATABASE
+# DB
 # ======================
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://")
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True
-)
-
-SessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False
-)
-
+engine = create_async_engine(DATABASE_URL, echo=False)
+SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
 # ======================
@@ -67,14 +53,6 @@ class Keyword(Base):
     text = Column(Text)
     mode = Column(String, default="contains")
 
-
-class Welcome(Base):
-    __tablename__ = "welcome"
-    id = Column(Integer, primary_key=True)
-    chat_id = Column(String, unique=True)
-    text = Column(Text)
-
-
 class AutoPost(Base):
     __tablename__ = "auto_post"
     id = Column(Integer, primary_key=True)
@@ -86,63 +64,104 @@ class AutoPost(Base):
 # ======================
 # BOT
 # ======================
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ======================
-# FASTAPI
+# AI MEMORY
 # ======================
-app = FastAPI()
+memory = {}
+
+async def ai_reply(user_id, text):
+    import openai
+    openai.api_key = os.getenv("OPENAI_KEY")
+
+    ctx = memory.get(user_id, [])
+    ctx.append({"role": "user", "content": text})
+
+    res = openai.ChatCompletion.create(
+        model="gpt-4o-mini",
+        messages=ctx[-10:]
+    )
+
+    reply = res.choices[0].message.content
+    ctx.append({"role": "assistant", "content": reply})
+    memory[user_id] = ctx
+
+    return reply
 
 # ======================
-# CACHE
+# HANDLER
 # ======================
-keyword_cache = []
-welcome_cache = {}
-auto_cache = []
-
-# ======================
-# LOAD CACHE
-# ======================
-async def load_cache():
-    global keyword_cache, welcome_cache, auto_cache
-
-    async with SessionLocal() as db:
-        kw = (await db.execute(select(Keyword))).scalars().all()
-        wl = (await db.execute(select(Welcome))).scalars().all()
-        ap = (await db.execute(select(AutoPost))).scalars().all()
-
-    keyword_cache = kw
-    welcome_cache = {w.chat_id: w for w in wl}
-    auto_cache = ap
-
-    logging.info("Cache loaded")
-
-# ======================
-# HANDLERS
-# ======================
-@dp.message(F.text)
+@dp.message()
 async def handle_message(m: types.Message):
+    if not m.text:
+        return
+
     text = m.text.lower()
 
-    for k in keyword_cache:
+    async with SessionLocal() as db:
+        kws = (await db.execute(select(Keyword))).scalars().all()
+
+    for k in kws:
         if (k.mode == "exact" and text == k.key) or (k.mode == "contains" and k.key in text):
             await m.answer(k.text)
             return
 
+    # AI fallback
+    reply = await ai_reply(m.from_user.id, text)
+    await m.answer(reply)
 
-@dp.chat_member()
-async def welcome(event: types.ChatMemberUpdated):
-    if event.new_chat_member.status == "member":
-        chat_id = str(event.chat.id)
-        w = welcome_cache.get(chat_id)
+# ======================
+# AUTO POST
+# ======================
+async def auto_worker():
+    while True:
+        now = int(time.time())
 
-        if w:
-            await bot.send_message(chat_id, w.text or "Welcome 👋")
+        async with SessionLocal() as db:
+            posts = (await db.execute(select(AutoPost))).scalars().all()
+
+            for p in posts:
+                if now - (p.last_sent or 0) > p.interval * 60:
+                    try:
+                        await bot.send_message(p.chat_id, p.text)
+
+                        p.last_sent = now
+                        await db.commit()
+
+                    except Exception as e:
+                        logging.error(e)
+
+        await asyncio.sleep(20)
+
+# ======================
+# APP
+# ======================
+app = FastAPI()
+
+# ======================
+# WEBSOCKET
+# ======================
+clients = []
+
+@app.websocket("/ws")
+async def ws(ws: WebSocket):
+    await ws.accept()
+    clients.append(ws)
+
+    try:
+        while True:
+            await ws.receive_text()
+    except:
+        clients.remove(ws)
+
+async def broadcast(data):
+    for c in clients:
+        try:
+            await c.send_json(data)
+        except:
+            pass
 
 # ======================
 # WEBHOOK
@@ -153,75 +172,26 @@ async def webhook(req: Request):
         data = await req.json()
         update = Update.model_validate(data)
         await dp.feed_update(bot, update)
-        return {"ok": True}
     except Exception as e:
         logging.error(e)
-        raise HTTPException(status_code=500)
 
-# ======================
-# ADMIN API
-# ======================
+    return JSONResponse({"ok": True})
+
 @app.get("/")
 async def home():
-    return {"status": "running"}
-
-
-@app.post("/add_keyword")
-async def add_keyword(req: Request):
-    data = await req.json()
-
-    async with SessionLocal() as db:
-        db.add(Keyword(key=data["key"], text=data["text"]))
-        await db.commit()
-
-    await load_cache()
-    return {"ok": True}
+    return {"status": "SaaS BOT RUNNING 🚀"}
 
 # ======================
-# AUTO POST WORKER
-# ======================
-async def auto_worker():
-    while True:
-        now = int(time.time())
-
-        for p in auto_cache:
-            if now - p.last_sent > p.interval * 60:
-                try:
-                    await bot.send_message(p.chat_id, p.text)
-
-                    async with SessionLocal() as db:
-                        row = await db.get(AutoPost, p.id)
-                        if row:
-                            row.last_sent = now
-                            await db.commit()
-
-                    p.last_sent = now
-
-                except Exception as e:
-                    logging.error(f"AutoPost error: {e}")
-
-        await asyncio.sleep(30)
-
-# ======================
-# STARTUP / SHUTDOWN
+# STARTUP
 # ======================
 @app.on_event("startup")
 async def startup():
-    logging.info("Starting app...")
-
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    await load_cache()
-
+    await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(WEBHOOK_URL)
-    logging.info(f"Webhook set: {WEBHOOK_URL}")
 
     asyncio.create_task(auto_worker())
 
-
-@app.on_event("shutdown")
-async def shutdown():
-    logging.info("Shutting down...")
-    await bot.delete_webhook()
-    await bot.session.close()
+    logging.info(f"Webhook: {WEBHOOK_URL}")
